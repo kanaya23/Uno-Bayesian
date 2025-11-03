@@ -590,17 +590,47 @@ class ConsoleUnoBNNInterface:
         )
 
         mc = evaluation["mc"]
-        mean_probs = mc["mean_probs"][0]
+        mean_probs = mc["mean_probs"].reshape(-1).clone()
+
         std_probs = mc.get("std_probs")
         if std_probs is not None:
-            std_probs = std_probs[0]
-        entropy = float(mc["predictive_entropy"][0].item())
-        mutual_information = float(mc["mutual_information"][0].item())
+            std_probs = std_probs.reshape(-1).clone()
+
+        entropy_tensor = mc["predictive_entropy"].reshape(-1)
+        entropy = float(entropy_tensor[0].item())
+
+        mi_tensor = mc["mutual_information"].reshape(-1)
+        mutual_information = float(mi_tensor[0].item())
 
         valid_actions = self._bnn_helper.enumerate_actions(self.engine, state, self.user_id)
         valid_token_map = {
             self.artifacts.action_encoder._to_token(action): action for action in valid_actions
         }
+
+        # Ensure mean_probs has the expected size for action encoder
+        expected_size = len(self.artifacts.action_encoder.lookup)
+        if mean_probs.numel() != expected_size:
+            # Model output size mismatch - create properly sized tensor
+            print(
+                f"Warning: Model output size ({mean_probs.numel()}) doesn't match action encoder size ({expected_size})"
+            )
+            device = mean_probs.device
+            dtype = mean_probs.dtype
+            corrected_probs = torch.full((expected_size,), 1.0 / expected_size, dtype=dtype, device=device)
+            copy_size = min(mean_probs.numel(), expected_size)
+            if copy_size > 0:
+                corrected_probs[:copy_size].copy_(mean_probs[:copy_size])
+
+            total = corrected_probs.sum()
+            if total.item() > 0:
+                corrected_probs = corrected_probs / total
+            mean_probs = corrected_probs
+
+            if std_probs is not None:
+                corrected_std = torch.zeros(expected_size, dtype=std_probs.dtype, device=std_probs.device)
+                if copy_size > 0:
+                    corrected_std[:copy_size].copy_(std_probs[:copy_size])
+                std_probs = corrected_std
 
         mask = torch.zeros_like(mean_probs)
         valid_indices: List[int] = []
@@ -608,7 +638,9 @@ class ConsoleUnoBNNInterface:
             idx = self.artifacts.action_encoder.lookup.get(token)
             if idx is None:
                 continue
-            valid_indices.append(int(idx))
+            # Ensure index is within bounds
+            if int(idx) < mean_probs.size(0):
+                valid_indices.append(int(idx))
         if valid_indices:
             mask[valid_indices] = 1.0
         mean_probs_masked = mean_probs * mask if valid_indices else mean_probs

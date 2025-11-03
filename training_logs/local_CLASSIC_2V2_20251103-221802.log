@@ -1,0 +1,51 @@
+2025-11-03 22:18:02 | INFO | notebooks.uno_bnn_curriculum_converted | Preset 'max' applied -> scenarios=3200, epochs=30, batch=192, lr=0.0025
+2025-11-03 22:18:02 | INFO | notebooks.uno_bnn_curriculum_converted | Using device: cpu
+2025-11-03 22:18:02 | INFO | notebooks.uno_bnn_curriculum_converted | Preparing synthetic dataset...
+2025-11-03 22:30:19 | INFO | notebooks.uno_bnn_curriculum_converted | Dataset ready | samples=16000 | features=103 | labels=66 | 736.4s
+2025-11-03 22:30:19 | DEBUG | notebooks.uno_bnn_curriculum_converted | Labeled persona decisions: 16000
+2025-11-03 22:30:20 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] device=cpu train=14400 val=1600 batch_size=192 lr=2.50e-03 workers=2
+2025-11-03 22:31:04 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 001/030 | train 4.6529 | val 4.5517 | acc 0.004 | beta 0.30 | 43.97s
+2025-11-03 22:31:31 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 002/030 | train 4.4281 | val 4.4400 | acc 0.013 | beta 0.38 | 26.85s
+2025-11-03 22:31:58 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 003/030 | train 4.2643 | val 4.1133 | acc 0.019 | beta 0.46 | 26.91s
+2025-11-03 22:32:24 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 004/030 | train 4.1001 | val 3.9981 | acc 0.009 | beta 0.53 | 26.93s
+2025-11-03 22:32:54 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 005/030 | train 3.9144 | val 3.8548 | acc 0.006 | beta 0.61 | 26.94s
+2025-11-03 22:33:21 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 006/030 | train 3.8493 | val 3.7978 | acc 0.021 | beta 0.69 | 26.86s
+2025-11-03 22:33:48 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 007/030 | train 3.8086 | val 3.6932 | acc 0.014 | beta 0.77 | 27.01s
+2025-11-03 22:34:15 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 008/030 | train 3.7698 | val 3.8219 | acc 0.031 | beta 0.84 | 27.54s
+2025-11-03 22:34:42 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 009/030 | train 3.7761 | val 3.7139 | acc 0.009 | beta 0.92 | 26.79s
+2025-11-03 22:35:12 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 010/030 | train 3.7620 | val 3.8055 | acc 0.003 | beta 1.00 | 29.59s
+2025-11-03 22:35:39 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 011/030 | train 3.7465 | val 3.6806 | acc 0.017 | beta 1.00 | 27.79s
+2025-11-03 22:36:11 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 012/030 | train 3.7104 | val 3.6524 | acc 0.021 | beta 1.00 | 31.76s
+2025-11-03 22:36:43 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 013/030 | train 3.6932 | val 3.6497 | acc 0.018 | beta 1.00 | 31.73s
+2025-11-03 22:37:14 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 014/030 | train 3.6698 | val 3.6299 | acc 0.011 | beta 1.00 | 30.82s
+2025-11-03 22:37:41 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 015/030 | train 3.6473 | val 3.5643 | acc 0.009 | beta 1.00 | 27.47s
+2025-11-03 22:38:08 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 016/030 | train 3.6125 | val 3.6009 | acc 0.011 | beta 1.00 | 27.04s
+2025-11-03 22:38:35 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 017/030 | train 3.5845 | val 3.5461 | acc 0.011 | beta 1.00 | 26.65s
+2025-11-03 22:39:02 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 018/030 | train 3.5957 | val 3.5061 | acc 0.019 | beta 1.00 | 26.76s
+2025-11-03 22:39:29 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 019/030 | train 3.5576 | val 3.5602 | acc 0.014 | beta 1.00 | 27.01s
+2025-11-03 22:39:56 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 020/030 | train 3.5237 | val 3.4567 | acc 0.011 | beta 1.00 | 26.89s
+2025-11-03 22:40:22 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 021/030 | train 3.5164 | val 3.4357 | acc 0.019 | beta 1.00 | 26.76s
+2025-11-03 22:40:50 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 022/030 | train 3.4851 | val 3.4079 | acc 0.014 | beta 1.00 | 27.28s
+2025-11-03 22:41:17 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 023/030 | train 3.4606 | val 3.3916 | acc 0.026 | beta 1.00 | 27.38s
+2025-11-03 22:41:44 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 024/030 | train 3.4565 | val 3.3295 | acc 0.013 | beta 1.00 | 26.81s
+2025-11-03 22:42:11 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 025/030 | train 3.4341 | val 3.3751 | acc 0.014 | beta 1.00 | 26.88s
+2025-11-03 22:42:37 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 026/030 | train 3.4275 | val 3.3759 | acc 0.011 | beta 1.00 | 26.83s
+2025-11-03 22:43:05 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 027/030 | train 3.4195 | val 3.3466 | acc 0.014 | beta 1.00 | 27.20s
+2025-11-03 22:43:31 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 028/030 | train 3.4061 | val 3.3808 | acc 0.011 | beta 1.00 | 26.80s
+2025-11-03 22:43:59 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 029/030 | train 3.4043 | val 3.3883 | acc 0.008 | beta 1.00 | 27.20s
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Epoch 030/030 | train 3.3729 | val 3.2848 | acc 0.010 | beta 1.00 | 26.87s
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted | [local_CLASSIC_2V2_20251103-221802_20251103-223020] Metrics logged to training_logs\local_CLASSIC_2V2_20251103-221802_20251103-223020.csv
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted | Training complete | final_train_loss=3.3729 | final_val_loss=3.2848 | final_val_acc=0.010
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted | Run summary
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted |   mode: CLASSIC_2V2
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted |   device: cpu
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted |   scenarios: 3200 | epochs: 30 | batch: 192
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted |   learning_rate: 0.0025 | clip_norm: 10.00
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted |   validation_split: 0.10 | workers: 2
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted |   progress_bar: True | log_batches: False (interval=10)
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted |   metrics_csv: training_logs\local_CLASSIC_2V2_20251103-221802_20251103-223020.csv
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted |   text_log: training_logs\local_CLASSIC_2V2_20251103-221802.log
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted |   export_dir: models | model_tag: <auto>
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted | Tip: rerun with `--dry-run` to preview settings or `--export` to save param_store and metadata.
+2025-11-03 22:44:26 | INFO | notebooks.uno_bnn_curriculum_converted | Exporting artifacts to C:\Users\bayum\Downloads\Uno-Bayesian-main (1)\Uno-Bayesian-main\models (tag=local_CLASSIC_2V2_20251103-221802)
+2025-11-03 22:44:28 | INFO | notebooks.uno_bnn_curriculum_converted | Artifacts exported: {'param_store': 'C:\\Users\\bayum\\Downloads\\Uno-Bayesian-main (1)\\Uno-Bayesian-main\\models\\local_CLASSIC_2V2_20251103-221802_param_store.pt', 'metadata': 'C:\\Users\\bayum\\Downloads\\Uno-Bayesian-main (1)\\Uno-Bayesian-main\\models\\local_CLASSIC_2V2_20251103-221802_meta.json'}

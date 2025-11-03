@@ -31,6 +31,7 @@ if IN_COLAB:
 
 import abc
 import argparse
+import copy
 import csv
 import dataclasses
 import enum
@@ -124,6 +125,7 @@ PLAYER_SEQUENCE = ("P0", "P1", "P2", "P3")
 TEAM_MAP = {"P0": 0, "P2": 0, "P1": 1, "P3": 1}
 TEAM_SCORES = {0: 0, 1: 0}
 STANDARD_COLORS = [Color.RED, Color.YELLOW, Color.GREEN, Color.BLUE]
+COLOR_VALUE_TO_ENUM = {color.value: color for color in STANDARD_COLORS}
 
 
 @dataclass
@@ -1123,6 +1125,45 @@ class ScenarioDataset(Dataset):
         return self.features[index], self.labels[index]
 
 # %% [code cell 8]
+class ConcreteDropout(PyroModule):
+    def __init__(
+        self,
+        init_p: float = 0.1,
+        *,
+        temperature: float = 0.1,
+        min_p: float = 0.05,
+        max_p: float = 0.4,
+    ) -> None:
+        super().__init__()
+        init_p = float(min(max(init_p, 1e-4), 0.9))
+        init_logit = math.log(init_p) - math.log(1.0 - init_p)
+        self.temperature = float(max(temperature, 1e-3))
+        self.min_p = float(min_p)
+        self.max_p = float(max_p)
+        self.logit_p = PyroParam(torch.tensor([init_logit], dtype=torch.float32))
+        self._eps = 1e-7
+
+    def _clamped_p(self, device: torch.device) -> torch.Tensor:
+        p = torch.sigmoid(self.logit_p.to(device))
+        lower = 0.0 if self.min_p is None else self.min_p
+        upper = 1.0 if self.max_p is None else self.max_p
+        return p.clamp(lower, upper)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        p = self._clamped_p(x.device)
+        if self.training:
+            eps = self._eps
+            u = torch.rand_like(x)
+            logistic = torch.log(u + eps) - torch.log1p(-u + eps)
+            logit = torch.log(p + eps) - torch.log1p(-p + eps)
+            dropout_prob = torch.sigmoid((logit + logistic) / self.temperature)
+            retain_prob = 1.0 - dropout_prob
+            scale = 1.0 / torch.clamp(1.0 - p, min=1e-5)
+            return x * retain_prob * scale
+        scale = 1.0 / torch.clamp(1.0 - p, min=1e-5)
+        return x * (1.0 - p) * scale
+
+
 class StateBayesianNN(PyroModule):
     def __init__(
         self,
@@ -1130,18 +1171,36 @@ class StateBayesianNN(PyroModule):
         num_classes: int,
         hidden_dim: int = 256,
         dropout: float = 0.1,
+        *,
+        dropout_temperature: float = 0.08,
+        dropout_min: float = 0.05,
+        dropout_max: float = 0.35,
+        confidence_lambda: float = 0.075,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
         device = device or torch.device("cpu")
         self.kl_scale = 1.0
+        self.confidence_lambda = float(max(confidence_lambda, 0.0))
         self.backbone = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            ConcreteDropout(
+                init_p=dropout,
+                temperature=dropout_temperature,
+                min_p=dropout_min,
+                max_p=dropout_max,
+            ),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.SiLU(),
+            ConcreteDropout(
+                init_p=dropout,
+                temperature=dropout_temperature,
+                min_p=dropout_min,
+                max_p=dropout_max,
+            ),
         )
         self.classifier = PyroModule[nn.Linear](hidden_dim // 2, num_classes)
         self.register_buffer(
@@ -1150,7 +1209,7 @@ class StateBayesianNN(PyroModule):
         )
         self.register_buffer(
             "_prior_weight_scale",
-            torch.ones(num_classes, hidden_dim // 2, device=device),
+            torch.full((num_classes, hidden_dim // 2), 0.1, device=device),
         )
         self.register_buffer(
             "_prior_bias_loc",
@@ -1158,7 +1217,7 @@ class StateBayesianNN(PyroModule):
         )
         self.register_buffer(
             "_prior_bias_scale",
-            torch.ones(num_classes, device=device),
+            torch.full((num_classes,), 0.1, device=device),
         )
         self.classifier.weight = PyroSample(
             dist.Normal(self._prior_weight_loc, self._prior_weight_scale).to_event(2)
@@ -1174,12 +1233,20 @@ class StateBayesianNN(PyroModule):
             logits = self.classifier(features)
         log_probs = F.log_softmax(logits, dim=-1)
         pyro.deterministic("logits", logits)
+        if self.confidence_lambda > 0:
+            probs = log_probs.exp()
+            entropy = -(probs * log_probs).sum(dim=-1)
+            penalty = -self.confidence_lambda * entropy.sum()
+            pyro.factor("confidence_regularizer", penalty)
         with pyro.plate("data", x.size(0)):
             pyro.sample("obs", dist.Categorical(logits=log_probs), obs=y)
         return log_probs
 
     def set_kl_scale(self, scale: float) -> None:
         self.kl_scale = float(max(scale, 0.0))
+
+    def set_confidence_lambda(self, value: float) -> None:
+        self.confidence_lambda = float(max(value, 0.0))
 
 
 class StateBNNGuide(PyroModule):
@@ -1192,12 +1259,12 @@ class StateBNNGuide(PyroModule):
         self.kl_scale = 1.0
         self.weight_loc = PyroParam(torch.zeros(num_classes, hidden_dim, device=device))
         self.weight_scale = PyroParam(
-            torch.ones(num_classes, hidden_dim, device=device),
+            torch.full((num_classes, hidden_dim), 0.1, device=device),
             constraint=constraints.positive,
         )
         self.bias_loc = PyroParam(torch.zeros(num_classes, device=device))
         self.bias_scale = PyroParam(
-            torch.ones(num_classes, device=device),
+            torch.full((num_classes,), 0.1, device=device),
             constraint=constraints.positive,
         )
 
@@ -1236,6 +1303,13 @@ class TrainingConfig:
     kl_beta_start: float = 0.3
     kl_beta_end: float = 1.0
     kl_warmup_epochs: int = 10
+    dropout_init: float = 0.12
+    confidence_lambda: float = 0.075
+    dropout_temperature: float = 0.08
+    dropout_min: float = 0.05
+    dropout_max: float = 0.35
+    entropy_calibration_samples: int = 128
+    calibration_dropout_samples: int = 40
 
 
 @dataclass
@@ -1289,7 +1363,16 @@ def train_bnn(
     input_dim = dataset.features.shape[1]
     num_classes = len(action_encoder.lookup)
 
-    model = StateBayesianNN(input_dim, num_classes, device=device).to(device)
+    model = StateBayesianNN(
+        input_dim,
+        num_classes,
+        dropout=config.dropout_init,
+        dropout_temperature=config.dropout_temperature,
+        dropout_min=config.dropout_min,
+        dropout_max=config.dropout_max,
+        confidence_lambda=config.confidence_lambda,
+        device=device,
+    ).to(device)
     guide = StateBNNGuide(model, device=device).to(device)
     optimizer = ClippedAdam({"lr": config.learning_rate, "clip_norm": config.clip_norm})
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
@@ -1476,6 +1559,33 @@ def train_bnn(
     if config.log_to_console and log_path is not None:
         logger.info(f"[{run_label}] Metrics logged to {log_path}")
 
+    if config.entropy_calibration_samples > 0:
+        calibration_batches: List[torch.Tensor] = []
+        collected = 0
+        for batch_x, _ in val_loader:
+            calibration_batches.append(batch_x)
+            collected += batch_x.size(0)
+            if collected >= config.entropy_calibration_samples:
+                break
+        if calibration_batches:
+            calibration_features = torch.cat(calibration_batches, dim=0)[: config.entropy_calibration_samples]
+            result = mc_predict(
+                artifacts,
+                calibration_features,
+                num_samples=config.calibration_dropout_samples,
+                use_dropout=True,
+                device=device,
+            )
+            entropies = result["predictive_entropy"].numpy()
+            entropy_mean = float(np.mean(entropies))
+            entropy_std = float(np.std(entropies) + 1e-8)
+            artifacts.metadata["entropy_calibration"] = {
+                "mean": entropy_mean,
+                "std": entropy_std,
+                "normalizer": float(max(entropy_std * 3.0, 1e-6)),
+                "samples": int(len(entropies)),
+            }
+
     return artifacts
 
 # %% [code cell 10]
@@ -1512,6 +1622,14 @@ def mc_predict(
         probs * probs.clamp(min=1e-8).log()
     ).sum(dim=-1).mean(dim=0)
     mutual_information = predictive_entropy - expected_entropy
+    calibration = artifacts.metadata.get("entropy_calibration") if hasattr(artifacts, "metadata") else None
+    normalized_entropy: Optional[torch.Tensor] = None
+    if calibration and calibration.get("normalizer"):
+        mean = torch.tensor(calibration.get("mean", 0.0), device=predictive_entropy.device, dtype=predictive_entropy.dtype)
+        normalizer = torch.tensor(calibration.get("normalizer", 1.0), device=predictive_entropy.device, dtype=predictive_entropy.dtype)
+        if normalizer.abs().item() < 1e-6:
+            normalizer = torch.tensor(1.0, device=predictive_entropy.device, dtype=predictive_entropy.dtype)
+        normalized_entropy = ((predictive_entropy - mean) / normalizer).clamp(0.0, 1.0)
     predictions = mean_probs.argmax(dim=-1)
 
     return {
@@ -1519,10 +1637,238 @@ def mc_predict(
         "std_probs": std_probs.detach().cpu(),
         "predictive_entropy": predictive_entropy.detach().cpu(),
         "mutual_information": mutual_information.detach().cpu(),
+        "normalized_entropy": normalized_entropy.detach().cpu() if normalized_entropy is not None else None,
         "predictions": predictions.detach().cpu(),
     }
 
 # %% [code cell 11]
+def _generate_stratified_scenarios(
+    forge: ScenarioForge,
+    *,
+    mode: GameMode,
+    num_scenarios: int,
+    rng: random.Random,
+) -> List[ScenarioExample]:
+    if num_scenarios <= 0:
+        return []
+    groups: Dict[str, Tuple[ScenarioType, ...]] = {
+        "early": (ScenarioType.SETUP,),
+        "mid": (ScenarioType.DEFENDER, ScenarioType.COLOR_TRAP),
+        "wild": (ScenarioType.WILD_DILEMMA,),
+        "finisher": (ScenarioType.FINISHER,),
+    }
+    bucket_order = list(groups.keys())
+    base = num_scenarios // len(bucket_order)
+    remainder = num_scenarios % len(bucket_order)
+    counts: Dict[str, int] = {name: base for name in bucket_order}
+    for idx in range(remainder):
+        counts[bucket_order[idx]] += 1
+
+    scenarios: List[ScenarioExample] = []
+    for name in bucket_order:
+        scenario_types = groups[name]
+        for _ in range(counts[name]):
+            scenario_type = rng.choice(scenario_types)
+            params = ScenarioParameters(scenario_type=scenario_type, mode=mode)
+            scenarios.append(forge.generate(params))
+    rng.shuffle(scenarios)
+    return scenarios
+
+
+def _cyclic_color_mappings() -> List[Dict[Color, Color]]:
+    mappings: List[Dict[Color, Color]] = []
+    for shift in range(1, len(STANDARD_COLORS)):
+        mapping = {
+            STANDARD_COLORS[index]: STANDARD_COLORS[(index + shift) % len(STANDARD_COLORS)]
+            for index in range(len(STANDARD_COLORS))
+        }
+        mappings.append(mapping)
+    return mappings
+
+
+def _map_color(color: Optional[Color], mapping: Dict[Color, Color]) -> Optional[Color]:
+    if color is None:
+        return None
+    if isinstance(color, Color) and color in mapping:
+        return mapping[color]
+    return color
+
+
+def _clone_card(card: Card, mapping: Dict[Color, Color], cache: Dict[int, Card]) -> Card:
+    key = id(card)
+    if key in cache:
+        return cache[key]
+    mapped_color = mapping.get(card.color, card.color)
+    cloned = Card(color=mapped_color, type=card.type, value=card.value, number=card.number)
+    cache[key] = cloned
+    return cloned
+
+
+def _clone_state_with_color_map(
+    state: GameState,
+    mapping: Dict[Color, Color],
+) -> Tuple[GameState, Dict[int, Card]]:
+    card_cache: Dict[int, Card] = {}
+
+    def clone_hand(cards: Sequence[Card]) -> List[Card]:
+        return [_clone_card(card, mapping, card_cache) for card in cards]
+
+    players = [
+        Player(player.player_id, hand=clone_hand(player.hand), score=player.score)
+        for player in state.players
+    ]
+    draw_pile = clone_hand(state.draw_pile)
+    discard_pile = clone_hand(state.discard_pile)
+
+    pending = None
+    if state.pending_action:
+        pending = PendingAction(
+            player_id=state.pending_action.player_id,
+            type=state.pending_action.type,
+            allowed_cards=tuple(
+                _clone_card(card, mapping, card_cache) for card in state.pending_action.allowed_cards
+            ),
+            draw_penalty=state.pending_action.draw_penalty,
+        )
+
+    new_state = GameState(
+        players=players,
+        draw_pile=draw_pile,
+        discard_pile=discard_pile,
+        current_player_index=state.current_player_index,
+        play_direction=state.play_direction,
+        current_color=_map_color(state.current_color, mapping),
+        pending_action=pending,
+        round_over=state.round_over,
+        round_winner_id=state.round_winner_id,
+        game_over=state.game_over,
+        game_winner_ids=state.game_winner_ids,
+        mode=state.mode,
+        team_map=dict(state.team_map),
+        team_scores=dict(state.team_scores),
+        round_winning_team_ids=state.round_winning_team_ids,
+        draw_stack_total=state.draw_stack_total,
+    )
+    return new_state, card_cache
+
+
+def _map_nested_colors(value: Any, mapping: Dict[Color, Color], card_cache: Dict[int, Card]) -> Any:
+    if isinstance(value, Card):
+        return card_cache.get(id(value), value)
+    if isinstance(value, Color):
+        return mapping.get(value, value)
+    if isinstance(value, str) and value in COLOR_VALUE_TO_ENUM:
+        mapped_color = mapping.get(COLOR_VALUE_TO_ENUM[value], COLOR_VALUE_TO_ENUM[value])
+        return mapped_color.value
+    if isinstance(value, dict):
+        return {k: _map_nested_colors(v, mapping, card_cache) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_map_nested_colors(item, mapping, card_cache) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_map_nested_colors(item, mapping, card_cache) for item in value)
+    return value
+
+
+def _map_metadata_colors(
+    metadata: Dict[str, Any],
+    mapping: Dict[Color, Color],
+    card_cache: Dict[int, Card],
+) -> Dict[str, Any]:
+    return {key: _map_nested_colors(value, mapping, card_cache) for key, value in metadata.items()}
+
+
+def _map_parameters(params: ScenarioParameters, mapping: Dict[Color, Color]) -> ScenarioParameters:
+    color_bias = _map_color(params.color_bias, mapping)
+    return dataclasses.replace(params, color_bias=color_bias)
+
+
+def _apply_color_permutation(
+    labeled: LabeledScenario,
+    mapping: Dict[Color, Color],
+) -> LabeledScenario:
+    scenario = labeled.scenario
+    state_clone, card_cache = _clone_state_with_color_map(scenario.state, mapping)
+    resulting_clone, result_card_cache = _clone_state_with_color_map(labeled.resulting_state, mapping)
+    combined_cache = {**card_cache, **result_card_cache}
+    new_params = _map_parameters(scenario.parameters, mapping)
+    new_metadata = _map_metadata_colors(scenario.metadata, mapping, card_cache)
+    new_scenario = ScenarioExample(
+        state=state_clone,
+        target_player=scenario.target_player,
+        scenario_type=scenario.scenario_type,
+        parameters=new_params,
+        metadata=new_metadata,
+    )
+    action_card = labeled.action.card
+    mapped_card = combined_cache.get(id(action_card)) if action_card is not None else None
+    new_action = BotAction(
+        action_type=labeled.action.action_type,
+        card=mapped_card,
+        chosen_color=_map_color(labeled.action.chosen_color, mapping),
+        info=_map_nested_colors(labeled.action.info, mapping, combined_cache),
+    )
+    new_info = _map_nested_colors(labeled.info, mapping, combined_cache)
+    if isinstance(new_info, dict):
+        new_info = dict(new_info)
+        new_info["augmentation_kind"] = "color_symmetry"
+    else:
+        new_info = {"augmentation_kind": "color_symmetry"}
+    return LabeledScenario(
+        scenario=new_scenario,
+        bot_name=labeled.bot_name,
+        action=new_action,
+        resulting_state=resulting_clone,
+        action_success=labeled.action_success,
+        info=new_info,
+    )
+
+
+def _augment_labeled_by_color_symmetry(
+    labeled: Sequence[LabeledScenario],
+    mappings: Sequence[Dict[Color, Color]],
+) -> List[LabeledScenario]:
+    augmented: List[LabeledScenario] = []
+    for example in labeled:
+        for mapping in mappings:
+            augmented.append(_apply_color_permutation(example, mapping))
+    return augmented
+
+
+def _augment_with_pseudo_replay(
+    labeled: Sequence[LabeledScenario],
+    *,
+    forge: ScenarioForge,
+    labeler: ScenarioLabeler,
+    bots: Sequence[BotPolicy],
+    rng: random.Random,
+    mode: GameMode,
+    max_samples: int = 10,
+) -> List[LabeledScenario]:
+    if not labeled or max_samples <= 0:
+        return []
+    sample_count = min(max_samples, max(5, len(labeled) // 20))
+    if sample_count <= 0:
+        return []
+    sampled = rng.sample(labeled, min(len(labeled), sample_count))
+    scenarios: List[ScenarioExample] = []
+    for example in sampled:
+        params = example.scenario.parameters
+        new_params = dataclasses.replace(
+            params,
+            color_bias=rng.choice(STANDARD_COLORS),
+            draw_stack_size=max(2, params.draw_stack_size + rng.randint(-1, 1)),
+            hand_diversity=max(2, min(4, params.hand_diversity + rng.randint(-1, 1))),
+            distance_to_victory=max(1, params.distance_to_victory + rng.randint(-1, 1)),
+        )
+        scenarios.append(forge.generate(new_params))
+    if not scenarios:
+        return []
+    augmented = labeler.label(scenarios, bots)
+    for entry in augmented:
+        entry.info.setdefault("augmentation_kind", "pseudo_replay")
+    return augmented
+
+
 def build_synthetic_dataset(
     *,
     mode: GameMode,
@@ -1531,29 +1877,24 @@ def build_synthetic_dataset(
     rng_seed: int = 1024,
     include_random_bot: bool = True,
 ) -> Tuple[ScenarioDataset, List[LabeledScenario], StateEncoder, ActionEncoder]:
-    scenario_mix = scenario_mix or {
-        ScenarioType.FINISHER: 0.20,
-        ScenarioType.DEFENDER: 0.20,
-        ScenarioType.SETUP: 0.20,
-        ScenarioType.COLOR_TRAP: 0.20,
-        ScenarioType.WILD_DILEMMA: 0.20,
-    }
     rng = random.Random(rng_seed)
     forge = ScenarioForge(rng=rng)
-    params = ScenarioParameters(scenario_type=ScenarioType.FINISHER, mode=mode)
-
-    scenarios: List[ScenarioExample] = []
-    batch_size = max(1, num_scenarios // 10)
-    while len(scenarios) < num_scenarios:
-        needed = min(batch_size, num_scenarios - len(scenarios))
-        scenarios.extend(
-            forge.generate_batch(
-                scenario_mix,
-                mode=mode,
-                batch_size=needed,
-                base_params=params,
+    if scenario_mix is None:
+        scenarios = _generate_stratified_scenarios(forge, mode=mode, num_scenarios=num_scenarios, rng=rng)
+    else:
+        params = ScenarioParameters(scenario_type=ScenarioType.FINISHER, mode=mode)
+        scenarios = []
+        batch_size = max(1, num_scenarios // 10)
+        while len(scenarios) < num_scenarios:
+            needed = min(batch_size, num_scenarios - len(scenarios))
+            scenarios.extend(
+                forge.generate_batch(
+                    scenario_mix,
+                    mode=mode,
+                    batch_size=needed,
+                    base_params=params,
+                )
             )
-        )
 
     rng_seed += 1
     bots: List[BotPolicy] = [
@@ -1566,7 +1907,20 @@ def build_synthetic_dataset(
         bots.append(RandomBot(rng=random.Random(rng_seed + 5)))
 
     labeler = ScenarioLabeler(rng=random.Random(rng_seed + 6))
-    labeled = labeler.label(scenarios, bots)
+    base_labeled = labeler.label(scenarios, bots)
+    augmented: List[LabeledScenario] = list(base_labeled)
+    color_augmented = _augment_labeled_by_color_symmetry(base_labeled, _cyclic_color_mappings())
+    augmented.extend(color_augmented)
+    pseudo_replay = _augment_with_pseudo_replay(
+        base_labeled,
+        forge=forge,
+        labeler=labeler,
+        bots=bots,
+        rng=rng,
+        mode=mode,
+    )
+    augmented.extend(pseudo_replay)
+    labeled = augmented
 
     state_encoder = StateEncoder()
     action_encoder = ActionEncoder()
@@ -1634,6 +1988,9 @@ class BNNBot(BotPolicy):
         mc_samples: int = 40,
         exploration_mi_threshold: float = 0.6,
         exploitation_entropy_threshold: float = 3.5,
+        prune_prob_threshold: float = 0.1,
+        prune_entropy_threshold: float = 0.8,
+        mi_bonus_weight: float = 0.25,
     ) -> None:
         super().__init__("BNNBot", rng=rng)
         self.artifacts = artifacts
@@ -1642,6 +1999,9 @@ class BNNBot(BotPolicy):
         self.mc_samples = mc_samples
         self.mi_explore_threshold = exploration_mi_threshold
         self.entropy_exploit_threshold = exploitation_entropy_threshold
+        self.prune_prob_threshold = prune_prob_threshold
+        self.prune_entropy_threshold = prune_entropy_threshold
+        self.mi_bonus_weight = mi_bonus_weight
 
     def decide(self, engine: UnoEngine, state: GameState, player_id: str) -> BotAction:
         scenario_type = self._infer_scenario_type(state, player_id)
@@ -1668,6 +2028,15 @@ class BNNBot(BotPolicy):
             std_probs_flat = std_probs[0].reshape(-1)
         entropy = result["predictive_entropy"][0].item()
         mutual_info = result["mutual_information"][0].item()
+        normalized_entropy_tensor = result.get("normalized_entropy")
+        normalized_entropy = None
+        if normalized_entropy_tensor is not None:
+            normalized_entropy = float(normalized_entropy_tensor[0].item())
+        effective_norm_entropy = (
+            normalized_entropy
+            if normalized_entropy is not None
+            else float(max(min(entropy / 4.0, 1.0), 0.0))
+        )
 
         valid_actions = self.enumerate_actions(engine, state, player_id)
         if not valid_actions:
@@ -1675,6 +2044,7 @@ class BNNBot(BotPolicy):
             fallback.info.update(
                 {
                     "bnn_entropy": entropy,
+                    "bnn_entropy_normalized": effective_norm_entropy,
                     "bnn_mutual_information": mutual_info,
                     "persona_hint": self.persona_hint,
                     "scenario_type": scenario_type.value,
@@ -1694,7 +2064,8 @@ class BNNBot(BotPolicy):
             if idx_int < 0 or idx_int >= mean_probs_flat.shape[0]:
                 continue
             probability = float(mean_probs_flat[idx_int].item())
-            mask[idx_int] = 1.0
+            pruned = effective_norm_entropy >= self.prune_entropy_threshold and probability < self.prune_prob_threshold
+            mask[idx_int] = 0.0 if pruned else 1.0
             std_val = None
             if std_probs_flat is not None and 0 <= idx_int < std_probs_flat.shape[0]:
                 std_val = float(std_probs_flat[idx_int].item())
@@ -1705,6 +2076,8 @@ class BNNBot(BotPolicy):
                     "idx": idx_int,
                     "raw_prob": probability,
                     "std": std_val,
+                    "pruned": pruned,
+                    "score": probability,
                 }
             )
 
@@ -1722,6 +2095,13 @@ class BNNBot(BotPolicy):
                 }
             )
             return fallback
+
+        if all(candidate.get("pruned", False) for candidate in candidates):
+            for candidate in candidates:
+                mask[candidate["idx"]] = 1.0
+                candidate["pruned"] = False
+
+        pruned_count = sum(1 for candidate in candidates if candidate.get("pruned", False))
 
         masked_probs = mean_probs_flat * mask
         normalization = float(masked_probs.sum().item())
@@ -1755,6 +2135,7 @@ class BNNBot(BotPolicy):
         action.info.update(
             {
                 "bnn_entropy": entropy,
+                "bnn_entropy_normalized": effective_norm_entropy,
                 "bnn_mutual_information": mutual_info,
                 "persona_hint": self.persona_hint,
                 "scenario_type": scenario_type.value,
@@ -1766,6 +2147,10 @@ class BNNBot(BotPolicy):
                 "entropy_threshold": self.entropy_exploit_threshold,
                 "mc_samples": self.mc_samples,
                 "candidate_count": len(candidates),
+                "pruned_candidates": pruned_count,
+                "prune_prob_threshold": self.prune_prob_threshold,
+                "prune_entropy_threshold": self.prune_entropy_threshold,
+                "mi_bonus_weight": self.mi_bonus_weight,
                 "probability_normalization": "uniform" if normalization <= 0 else "masked",
                 "bnn_token": selected["token"],
             }
@@ -1776,12 +2161,13 @@ class BNNBot(BotPolicy):
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "BNNBot decision | player=%s | token=%s | reason=%s | prob=%.4f | entropy=%.3f | MI=%.3f",
+                "BNNBot decision | player=%s | token=%s | reason=%s | prob=%.4f | entropy=%.3f | norm_entropy=%.3f | MI=%.3f",
                 player_id,
                 selected["token"],
                 selection_reason,
                 action.info.get("bnn_probability", 0.0),
                 entropy,
+                effective_norm_entropy,
                 mutual_info,
             )
 

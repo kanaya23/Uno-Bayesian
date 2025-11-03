@@ -1976,6 +1976,290 @@ def export_artifacts(
 
     return {"param_store": str(param_store_path), "metadata": str(meta_path)}
 
+
+def _sample_playable_scenarios(
+    forge: ScenarioForge,
+    *,
+    mode: GameMode,
+    engine: UnoEngine,
+    rng: random.Random,
+    count: int,
+) -> List[ScenarioExample]:
+    scenarios: List[ScenarioExample] = []
+    attempts = 0
+    while len(scenarios) < count and attempts < count * 15:
+        attempts += 1
+        scenario_type = rng.choice(list(ScenarioType))
+        params = ScenarioParameters(scenario_type=scenario_type, mode=mode)
+        scenario = forge.generate(params)
+        if engine.get_valid_moves(scenario.state, scenario.target_player):
+            scenarios.append(scenario)
+    return scenarios
+
+
+def _draw_vs_play_sanity(
+    bnn_bot: BNNBot,
+    engine: UnoEngine,
+    scenarios: Sequence[ScenarioExample],
+    *,
+    required_ratio: float = 0.8,
+) -> Dict[str, Any]:
+    if not scenarios:
+        return {"passed": False, "play_ratio": 0.0, "required_ratio": required_ratio, "samples": 0}
+    plays = 0
+    for scenario in scenarios:
+        action = bnn_bot.decide(engine, scenario.state, scenario.target_player)
+        if action.action_type == ActionType.PLAY:
+            plays += 1
+    ratio = plays / len(scenarios)
+    return {
+        "passed": ratio >= required_ratio,
+        "play_ratio": ratio,
+        "required_ratio": required_ratio,
+        "samples": len(scenarios),
+    }
+
+
+def _entropy_sanity(
+    artifacts: TrainingArtifacts,
+    bnn_bot: BNNBot,
+    scenarios: Sequence[ScenarioExample],
+    *,
+    threshold: float = 2.5,
+    mc_samples: int = 40,
+) -> Dict[str, Any]:
+    entropies: List[float] = []
+    for scenario in scenarios:
+        scenario_type = bnn_bot._infer_scenario_type(scenario.state, scenario.target_player)
+        metadata = bnn_bot._infer_metadata(scenario.state, scenario.target_player)
+        evaluation = evaluate_state_with_bnn(
+            artifacts,
+            state=scenario.state,
+            target_player=scenario.target_player,
+            persona_name=bnn_bot.persona_hint,
+            scenario_type=scenario_type,
+            metadata=metadata,
+            num_samples=mc_samples,
+        )
+        entropy = float(evaluation["mc"]["predictive_entropy"][0].item())
+        entropies.append(entropy)
+    mean_entropy = float(np.mean(entropies)) if entropies else float("nan")
+    return {
+        "passed": bool(entropies) and mean_entropy < threshold,
+        "mean_entropy": mean_entropy,
+        "threshold": threshold,
+        "samples": len(entropies),
+    }
+
+
+def _color_symmetry_check(
+    artifacts: TrainingArtifacts,
+    bnn_bot: BNNBot,
+    engine: UnoEngine,
+    forge: ScenarioForge,
+    *,
+    rng: random.Random,
+    mode: GameMode,
+    samples: int = 40,
+    tolerance: float = 0.05,
+    required_ratio: float = 0.9,
+) -> Dict[str, Any]:
+    mappings = _cyclic_color_mappings()
+    successes = 0
+    total = 0
+    for _ in range(samples):
+        scenario_type = rng.choice(list(ScenarioType))
+        params = ScenarioParameters(scenario_type=scenario_type, mode=mode)
+        scenario = forge.generate(params)
+        original_action = bnn_bot.decide(engine, scenario.state, scenario.target_player)
+        original_token = artifacts.action_encoder._to_token(original_action)
+        original_prob = float(original_action.info.get("bnn_probability", 0.0))
+
+        labeled = LabeledScenario(
+            scenario=scenario,
+            bot_name=bnn_bot.persona_hint,
+            action=BotAction(ActionType.DRAW),
+            resulting_state=scenario.state,
+            action_success=True,
+        )
+        mapping = rng.choice(mappings)
+        permuted = _apply_color_permutation(labeled, mapping)
+        permuted_action = bnn_bot.decide(engine, permuted.scenario.state, permuted.scenario.target_player)
+        permuted_token = artifacts.action_encoder._to_token(permuted_action)
+        permuted_prob = float(permuted_action.info.get("bnn_probability", 0.0))
+
+        if original_token == permuted_token and abs(original_prob - permuted_prob) <= tolerance:
+            successes += 1
+        total += 1
+
+    ratio = (successes / total) if total else 0.0
+    return {
+        "passed": total > 0 and ratio >= required_ratio,
+        "success_ratio": ratio,
+        "required_ratio": required_ratio,
+        "tolerance": tolerance,
+        "samples": total,
+    }
+
+
+def _generate_forced_draw_scenarios(
+    forge: ScenarioForge,
+    *,
+    engine: UnoEngine,
+    mode: GameMode,
+    rng: random.Random,
+    count: int,
+) -> List[ScenarioExample]:
+    scenarios: List[ScenarioExample] = []
+    attempts = 0
+    while len(scenarios) < count and attempts < count * 25:
+        attempts += 1
+        top_color = rng.choice(STANDARD_COLORS)
+        top_number = rng.randint(0, 9)
+        top_card = forge._make_number_card(top_color, top_number)
+
+        other_colors = [color for color in STANDARD_COLORS if color != top_color]
+        hand_size = rng.randint(3, 5)
+        target_hand: List[Card] = []
+        while len(target_hand) < hand_size:
+            color = rng.choice(other_colors)
+            number = rng.randint(0, 9)
+            if number == top_number:
+                continue
+            target_hand.append(forge._make_number_card(color, number))
+
+        hands = {
+            pid: forge._make_random_hand(mode, hand_size=rng.randint(4, 7))
+            for pid in PLAYER_SEQUENCE
+        }
+        hands["P0"] = target_hand
+
+        state = forge._assemble_state(
+            mode=mode,
+            hands=hands,
+            discard=[top_card],
+            current_player_index=0,
+            current_color=top_color,
+        )
+
+        if engine.get_valid_moves(state, "P0"):
+            continue
+
+        params = ScenarioParameters(scenario_type=ScenarioType.SETUP, mode=mode)
+        scenarios.append(
+            ScenarioExample(
+                state=state,
+                target_player="P0",
+                scenario_type=ScenarioType.SETUP,
+                parameters=params,
+                metadata={"forced_draw": True},
+            )
+        )
+
+    return scenarios
+
+
+def _overconfidence_check(
+    artifacts: TrainingArtifacts,
+    bnn_bot: BNNBot,
+    scenarios: Sequence[ScenarioExample],
+    *,
+    threshold: float = 3.5,
+    mc_samples: int = 40,
+) -> Dict[str, Any]:
+    entropies: List[float] = []
+    for scenario in scenarios:
+        scenario_type = bnn_bot._infer_scenario_type(scenario.state, scenario.target_player)
+        metadata = bnn_bot._infer_metadata(scenario.state, scenario.target_player)
+        evaluation = evaluate_state_with_bnn(
+            artifacts,
+            state=scenario.state,
+            target_player=scenario.target_player,
+            persona_name=bnn_bot.persona_hint,
+            scenario_type=scenario_type,
+            metadata=metadata,
+            num_samples=mc_samples,
+        )
+        entropy = float(evaluation["mc"]["predictive_entropy"][0].item())
+        entropies.append(entropy)
+    passed = bool(entropies) and all(entropy >= threshold for entropy in entropies)
+    mean_entropy = float(np.mean(entropies)) if entropies else float("nan")
+    min_entropy = float(min(entropies)) if entropies else float("nan")
+    return {
+        "passed": passed,
+        "mean_entropy": mean_entropy,
+        "min_entropy": min_entropy,
+        "threshold": threshold,
+        "samples": len(entropies),
+    }
+
+
+def run_pragmatic_checks(
+    artifacts: TrainingArtifacts,
+    *,
+    mode: GameMode,
+    persona_hint: str = "OracleBot",
+    rng_seed: int = 2025,
+    playable_samples: int = 100,
+    entropy_samples: int = 100,
+    symmetry_samples: int = 40,
+    overconfidence_samples: int = 40,
+) -> Dict[str, Any]:
+    rng = random.Random(rng_seed)
+    forge = ScenarioForge(rng=random.Random(rng_seed + 1))
+    engine = UnoEngine()
+    bnn_bot = BNNBot(
+        artifacts,
+        persona_hint=persona_hint,
+        rng=random.Random(rng_seed + 2),
+    )
+
+    playable = _sample_playable_scenarios(
+        forge,
+        mode=mode,
+        engine=engine,
+        rng=random.Random(rng_seed + 3),
+        count=playable_samples,
+    )
+
+    entropy_pool = playable[: entropy_samples]
+    if len(entropy_pool) < entropy_samples:
+        additional = _sample_playable_scenarios(
+            forge,
+            mode=mode,
+            engine=engine,
+            rng=random.Random(rng_seed + 7),
+            count=max(0, entropy_samples - len(entropy_pool)),
+        )
+        entropy_pool = list(entropy_pool) + additional
+
+    forced_draw = _generate_forced_draw_scenarios(
+        forge,
+        engine=engine,
+        mode=mode,
+        rng=random.Random(rng_seed + 5),
+        count=overconfidence_samples,
+    )
+
+    tests = {
+        "draw_vs_play": _draw_vs_play_sanity(bnn_bot, engine, playable),
+        "entropy": _entropy_sanity(artifacts, bnn_bot, entropy_pool, mc_samples=40),
+        "color_symmetry": _color_symmetry_check(
+            artifacts,
+            bnn_bot,
+            engine,
+            forge,
+            rng=random.Random(rng_seed + 4),
+            mode=mode,
+            samples=symmetry_samples,
+        ),
+        "overconfidence": _overconfidence_check(artifacts, bnn_bot, forced_draw, mc_samples=40),
+    }
+
+    all_passed = all(result.get("passed", False) for result in tests.values())
+    return {"all_passed": all_passed, "tests": tests}
+
+
 # %% [code cell 13]
 class BNNBot(BotPolicy):
     def __init__(
@@ -2003,7 +2287,12 @@ class BNNBot(BotPolicy):
         self.prune_entropy_threshold = prune_entropy_threshold
         self.mi_bonus_weight = mi_bonus_weight
 
-    def decide(self, engine: UnoEngine, state: GameState, player_id: str) -> BotAction:
+    def evaluate_candidates(
+        self,
+        engine: UnoEngine,
+        state: GameState,
+        player_id: str,
+    ) -> Dict[str, Any]:
         scenario_type = self._infer_scenario_type(state, player_id)
         metadata = self._infer_metadata(state, player_id)
         features = self.artifacts.state_encoder.encode_components(
@@ -2039,7 +2328,141 @@ class BNNBot(BotPolicy):
         )
 
         valid_actions = self.enumerate_actions(engine, state, player_id)
+        evaluation: Dict[str, Any] = {
+            "scenario_type": scenario_type,
+            "metadata": metadata,
+            "mean_probs": mean_probs_flat,
+            "std_probs": std_probs_flat,
+            "entropy": entropy,
+            "normalized_entropy": effective_norm_entropy,
+            "mutual_information": mutual_info,
+            "valid_actions": valid_actions,
+            "mc_samples": self.mc_samples,
+            "prediction_token": self.artifacts.action_encoder.decode(int(result["predictions"][0].item())),
+        }
+
         if not valid_actions:
+            evaluation.update(
+                {
+                    "candidates": [],
+                    "mask": torch.zeros_like(mean_probs_flat),
+                    "mean_probs_masked": mean_probs_flat,
+                    "std_probs_masked": std_probs_flat,
+                    "pruned_count": 0,
+                    "normalization": 0.0,
+                    "normalization_kind": "uniform",
+                    "prob_mean": float(mean_probs_flat.mean().item()) if mean_probs_flat.numel() else 0.0,
+                    "prob_std": float(mean_probs_flat.std(unbiased=False).item()) if mean_probs_flat.numel() else 0.0,
+                }
+            )
+            return evaluation
+
+        mask = torch.zeros_like(mean_probs_flat)
+        candidates: List[Dict[str, Any]] = []
+        for action in valid_actions:
+            token = self.artifacts.action_encoder._to_token(action)
+            idx = self.artifacts.action_encoder.lookup.get(token)
+            if idx is None:
+                continue
+            idx_int = int(idx)
+            if idx_int < 0 or idx_int >= mean_probs_flat.shape[0]:
+                continue
+            probability = float(mean_probs_flat[idx_int].item())
+            pruned = (
+                effective_norm_entropy >= self.prune_entropy_threshold
+                and probability < self.prune_prob_threshold
+            )
+            mask[idx_int] = 0.0 if pruned else 1.0
+            std_val = None
+            if std_probs_flat is not None and 0 <= idx_int < std_probs_flat.shape[0]:
+                std_val = float(std_probs_flat[idx_int].item())
+            candidates.append(
+                {
+                    "action": action,
+                    "token": token,
+                    "idx": idx_int,
+                    "raw_prob": probability,
+                    "std": std_val,
+                    "pruned": pruned,
+                }
+            )
+
+        if not candidates:
+            evaluation.update(
+                {
+                    "candidates": [],
+                    "mask": mask,
+                    "mean_probs_masked": mean_probs_flat,
+                    "std_probs_masked": std_probs_flat,
+                    "pruned_count": 0,
+                    "normalization": 0.0,
+                    "normalization_kind": "uniform",
+                    "prob_mean": float(mean_probs_flat.mean().item()) if mean_probs_flat.numel() else 0.0,
+                    "prob_std": float(mean_probs_flat.std(unbiased=False).item()) if mean_probs_flat.numel() else 0.0,
+                }
+            )
+            return evaluation
+
+        if all(candidate.get("pruned", False) for candidate in candidates):
+            for candidate in candidates:
+                mask[candidate["idx"]] = 1.0
+                candidate["pruned"] = False
+
+        pruned_count = sum(1 for candidate in candidates if candidate.get("pruned", False))
+
+        masked_probs = mean_probs_flat * mask
+        normalization = float(masked_probs.sum().item())
+        normalization_kind = "masked"
+        if normalization <= 0 or mask.sum().item() <= 0:
+            normalization_kind = "uniform"
+            uniform = 1.0 / len(candidates)
+            for candidate in candidates:
+                candidate["prob"] = uniform
+            mean_probs_masked = mean_probs_flat
+            std_probs_masked = std_probs_flat
+        else:
+            masked_probs = masked_probs / masked_probs.sum()
+            for candidate in candidates:
+                candidate["prob"] = float(masked_probs[candidate["idx"]].item())
+            mean_probs_masked = masked_probs
+            std_probs_masked = (
+                std_probs_flat * mask if std_probs_flat is not None else None
+            )
+
+        candidates.sort(key=lambda item: item["prob"], reverse=True)
+
+        if mean_probs_masked is not None and isinstance(mean_probs_masked, torch.Tensor):
+            prob_tensor = mean_probs_masked
+        else:
+            prob_tensor = mean_probs_flat
+
+        prob_mean = float(prob_tensor.mean().item()) if prob_tensor.numel() else 0.0
+        prob_std = float(prob_tensor.std(unbiased=False).item()) if prob_tensor.numel() else 0.0
+
+        evaluation.update(
+            {
+                "candidates": candidates,
+                "mask": mask,
+                "mean_probs_masked": prob_tensor,
+                "std_probs_masked": std_probs_masked,
+                "pruned_count": pruned_count,
+                "normalization": normalization,
+                "normalization_kind": normalization_kind,
+                "prob_mean": prob_mean,
+                "prob_std": prob_std,
+            }
+        )
+        return evaluation
+
+    def decide(self, engine: UnoEngine, state: GameState, player_id: str) -> BotAction:
+        evaluation = self.evaluate_candidates(engine, state, player_id)
+        entropy = evaluation["entropy"]
+        mutual_info = evaluation["mutual_information"]
+        effective_norm_entropy = evaluation["normalized_entropy"]
+        scenario_type: ScenarioType = evaluation["scenario_type"]
+        candidates: List[Dict[str, Any]] = evaluation["candidates"]
+
+        if not evaluation["valid_actions"]:
             fallback = BotAction(ActionType.DRAW)
             fallback.info.update(
                 {
@@ -2053,37 +2476,8 @@ class BNNBot(BotPolicy):
             )
             return fallback
 
-        mask = torch.zeros_like(mean_probs_flat)
-        candidates: List[Dict[str, Any]] = []
-        for action in valid_actions:
-            token = self.artifacts.action_encoder._to_token(action)
-            idx = self.artifacts.action_encoder.lookup.get(token)
-            if idx is None:
-                continue
-            idx_int = int(idx)
-            if idx_int < 0 or idx_int >= mean_probs_flat.shape[0]:
-                continue
-            probability = float(mean_probs_flat[idx_int].item())
-            pruned = effective_norm_entropy >= self.prune_entropy_threshold and probability < self.prune_prob_threshold
-            mask[idx_int] = 0.0 if pruned else 1.0
-            std_val = None
-            if std_probs_flat is not None and 0 <= idx_int < std_probs_flat.shape[0]:
-                std_val = float(std_probs_flat[idx_int].item())
-            candidates.append(
-                {
-                    "action": action,
-                    "token": token,
-                    "idx": idx_int,
-                    "raw_prob": probability,
-                    "std": std_val,
-                    "pruned": pruned,
-                    "score": probability,
-                }
-            )
-
         if not candidates:
-            token_idx = int(result["predictions"][0].item())
-            token = self.artifacts.action_encoder.decode(token_idx)
+            token = evaluation["prediction_token"]
             fallback = self.artifacts.action_encoder.token_to_action(token, state, player_id)
             fallback.info.update(
                 {
@@ -2095,26 +2489,6 @@ class BNNBot(BotPolicy):
                 }
             )
             return fallback
-
-        if all(candidate.get("pruned", False) for candidate in candidates):
-            for candidate in candidates:
-                mask[candidate["idx"]] = 1.0
-                candidate["pruned"] = False
-
-        pruned_count = sum(1 for candidate in candidates if candidate.get("pruned", False))
-
-        masked_probs = mean_probs_flat * mask
-        normalization = float(masked_probs.sum().item())
-        if normalization <= 0:
-            uniform = 1.0 / len(candidates)
-            for candidate in candidates:
-                candidate["prob"] = uniform
-        else:
-            masked_probs = masked_probs / masked_probs.sum()
-            for candidate in candidates:
-                candidate["prob"] = float(masked_probs[candidate["idx"]].item())
-
-        candidates.sort(key=lambda item: item["prob"], reverse=True)
 
         selection_reason = "probability"
         selected = candidates[0]
@@ -2145,13 +2519,13 @@ class BNNBot(BotPolicy):
                 "selection_reason": selection_reason,
                 "mi_threshold": self.mi_explore_threshold,
                 "entropy_threshold": self.entropy_exploit_threshold,
-                "mc_samples": self.mc_samples,
+                "mc_samples": evaluation["mc_samples"],
                 "candidate_count": len(candidates),
-                "pruned_candidates": pruned_count,
+                "pruned_candidates": evaluation["pruned_count"],
                 "prune_prob_threshold": self.prune_prob_threshold,
                 "prune_entropy_threshold": self.prune_entropy_threshold,
                 "mi_bonus_weight": self.mi_bonus_weight,
-                "probability_normalization": "uniform" if normalization <= 0 else "masked",
+                "probability_normalization": evaluation["normalization_kind"],
                 "bnn_token": selected["token"],
             }
         )
@@ -2287,6 +2661,196 @@ class BNNBot(BotPolicy):
                 if card.color in counts:
                     counts[card.color] += 1
         return counts
+
+
+class BNNMCTSBot(OracleBot):
+    def __init__(
+        self,
+        artifacts: TrainingArtifacts,
+        *,
+        persona_hint: str = "OracleBot",
+        rng: Optional[random.Random] = None,
+        rollout_count: int = 16,
+        rollout_depth: int = 6,
+        mc_samples: int = 40,
+        prior_weight: float = 0.55,
+        bonus_rollout_factor: float = 0.6,
+        exploration_mi_threshold: float = 0.6,
+        exploitation_entropy_threshold: float = 3.5,
+        prune_prob_threshold: float = 0.1,
+        prune_entropy_threshold: float = 0.8,
+        mi_bonus_weight: float = 0.25,
+        uncertainty_threshold: float = 0.25,
+    ) -> None:
+        super().__init__(rollout_count=rollout_count, rollout_depth=rollout_depth, rng=rng)
+        self.artifacts = artifacts
+        self.persona_hint = persona_hint if persona_hint in BOT_ORDER else BOT_ORDER[0]
+        self.prior_weight = float(min(max(prior_weight, 0.0), 1.0))
+        self.bonus_rollout_factor = float(max(bonus_rollout_factor, 0.0))
+        self.bnn_helper = BNNBot(
+            artifacts,
+            persona_hint=self.persona_hint,
+            rng=self.rng,
+            uncertainty_threshold=uncertainty_threshold,
+            mc_samples=mc_samples,
+            exploration_mi_threshold=exploration_mi_threshold,
+            exploitation_entropy_threshold=exploitation_entropy_threshold,
+            prune_prob_threshold=prune_prob_threshold,
+            prune_entropy_threshold=prune_entropy_threshold,
+            mi_bonus_weight=mi_bonus_weight,
+        )
+        self.name = f"{self.persona_hint}+MCTS"
+
+    def decide(self, engine: UnoEngine, state: GameState, player_id: str) -> BotAction:
+        evaluation = self.bnn_helper.evaluate_candidates(engine, state, player_id)
+        entropy = evaluation["entropy"]
+        mutual_info = evaluation["mutual_information"]
+        normalized_entropy = evaluation["normalized_entropy"]
+        scenario_type: ScenarioType = evaluation["scenario_type"]
+        candidates: List[Dict[str, Any]] = evaluation["candidates"]
+
+        if not evaluation["valid_actions"] or not candidates:
+            return self.bnn_helper.decide(engine, state, player_id)
+
+        actionable = [candidate for candidate in candidates if not candidate.get("pruned", False)]
+        if not actionable:
+            actionable = candidates
+
+        base_rollouts = max(1, self.rollout_count)
+        rollout_cap = max(base_rollouts, int(base_rollouts * (1.0 + 2.0 * self.bonus_rollout_factor)))
+        bonus_scale = 0.0
+        if mutual_info > self.bnn_helper.mi_explore_threshold:
+            bonus_scale = self.bonus_rollout_factor * (
+                mutual_info - self.bnn_helper.mi_explore_threshold
+            )
+            bonus_scale = max(bonus_scale, 0.0)
+
+        value_entries: List[Dict[str, Any]] = []
+        for candidate in actionable:
+            bonus = 0
+            if bonus_scale > 0:
+                bonus = int(round(base_rollouts * bonus_scale * max(candidate.get("prob", 0.0), 0.0)))
+            rollouts = max(1, min(rollout_cap, base_rollouts + bonus))
+            value = self._simulate_action(state, player_id, candidate["action"], rollouts)
+            value_entries.append(
+                {
+                    "candidate": candidate,
+                    "value": value,
+                    "rollouts": rollouts,
+                }
+            )
+
+        if not value_entries:
+            return self.bnn_helper.decide(engine, state, player_id)
+
+        values = [entry["value"] for entry in value_entries]
+        min_val = min(values)
+        max_val = max(values)
+        if math.isclose(max_val, min_val):
+            normalized_values = [0.5 for _ in values]
+        else:
+            span = max_val - min_val
+            normalized_values = [(val - min_val) / span for val in values]
+
+        combined_entries: List[Dict[str, Any]] = []
+        for entry, norm_value in zip(value_entries, normalized_values):
+            candidate = entry["candidate"]
+            combined_score = (
+                self.prior_weight * candidate.get("prob", 0.0)
+                + (1.0 - self.prior_weight) * norm_value
+            )
+            combined_entries.append(
+                {
+                    "candidate": candidate,
+                    "combined_score": combined_score,
+                    "norm_value": norm_value,
+                    "raw_value": entry["value"],
+                    "rollouts": entry["rollouts"],
+                }
+            )
+
+        combined_entries.sort(key=lambda item: item["combined_score"], reverse=True)
+        selected_entry = combined_entries[0]
+        selected_candidate = selected_entry["candidate"]
+        action = selected_candidate["action"]
+
+        has_play_option = any(candidate["action"].action_type == ActionType.PLAY for candidate in candidates)
+
+        bnn_reference_reason = "probability"
+        bnn_reference = candidates[0]
+        if mutual_info > self.bnn_helper.mi_explore_threshold:
+            exploratory = self.bnn_helper._select_exploration_candidate(state, candidates)
+            if exploratory is not None:
+                bnn_reference = exploratory
+                bnn_reference_reason = "explore_high_mi"
+        elif entropy < self.bnn_helper.entropy_exploit_threshold:
+            exploit = self.bnn_helper._select_exploitation_candidate(candidates)
+            if exploit is not None:
+                bnn_reference = exploit
+                bnn_reference_reason = "exploit_low_entropy"
+
+        action.info.update(
+            {
+                "bnn_entropy": entropy,
+                "bnn_entropy_normalized": normalized_entropy,
+                "bnn_mutual_information": mutual_info,
+                "persona_hint": self.persona_hint,
+                "scenario_type": scenario_type.value,
+                "bnn_probability": selected_candidate.get("prob", 0.0),
+                "bnn_probability_raw": selected_candidate.get("raw_prob", 0.0),
+                "bnn_probability_std": selected_candidate.get("std"),
+                "selection_reason": "mcts_guided",
+                "mi_threshold": self.bnn_helper.mi_explore_threshold,
+                "entropy_threshold": self.bnn_helper.entropy_exploit_threshold,
+                "mc_samples": evaluation["mc_samples"],
+                "candidate_count": len(candidates),
+                "pruned_candidates": evaluation["pruned_count"],
+                "prune_prob_threshold": self.bnn_helper.prune_prob_threshold,
+                "prune_entropy_threshold": self.bnn_helper.prune_entropy_threshold,
+                "mi_bonus_weight": self.bnn_helper.mi_bonus_weight,
+                "probability_normalization": evaluation["normalization_kind"],
+                "bnn_token": selected_candidate["token"],
+                "mcts_value": selected_entry["raw_value"],
+                "mcts_value_normalized": selected_entry["norm_value"],
+                "mcts_rollouts_used": selected_entry["rollouts"],
+                "mcts_prior_weight": self.prior_weight,
+                "mcts_bonus_rollout_factor": self.bonus_rollout_factor,
+                "bnn_reference_token": bnn_reference["token"],
+                "bnn_reference_reason": bnn_reference_reason,
+                "bnn_candidate_pruned": selected_candidate.get("pruned", False),
+                "combined_score": selected_entry["combined_score"],
+            }
+        )
+
+        if action.action_type == ActionType.DRAW:
+            action.info["forfeits_turn"] = has_play_option
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "BNNMCTS decision | player=%s | token=%s | combined=%.4f | prob=%.4f | value=%.4f | MI=%.3f",
+                player_id,
+                selected_candidate["token"],
+                selected_entry["combined_score"],
+                selected_candidate.get("prob", 0.0),
+                selected_entry["raw_value"],
+                mutual_info,
+            )
+
+        return action
+
+    def _simulate_action(
+        self,
+        state: GameState,
+        player_id: str,
+        action: BotAction,
+        rollouts: int,
+    ) -> float:
+        total = 0.0
+        for _ in range(max(1, rollouts)):
+            simulated = self._apply_action(state, player_id, action)
+            total += self._rollout_value(simulated, player_id)
+        return total / max(1, rollouts)
+
 
 # %% [code cell 14]
 def evaluate_state_with_bnn(
@@ -2876,6 +3440,27 @@ def run_cli() -> None:
     )
 
     _log_configuration_summary(args, log_file=log_file_path, csv_path=artifacts.log_path)
+
+    try:
+        checks = run_pragmatic_checks(artifacts, mode=mode)
+    except Exception as exc:  # pragma: no cover - defensive reporting
+        logger.warning("Pragmatic checks failed to execute: %s", exc)
+        checks = None
+    if checks is not None:
+        for name, report in checks["tests"].items():
+            status = "PASS" if report.get("passed") else "FAIL"
+            detail_parts: List[str] = []
+            for key, value in report.items():
+                if key == "passed":
+                    continue
+                if isinstance(value, float):
+                    detail_parts.append(f"{key}={value:.3f}")
+                else:
+                    detail_parts.append(f"{key}={value}")
+            detail = " | " + "; ".join(detail_parts) if detail_parts else ""
+            logger.info("Pragmatic check [%s]: %s%s", name, status, detail)
+        if not checks.get("all_passed", False):
+            logger.warning("BNN pragmatic checks did not fully pass; review the metrics above before integration.")
 
     logger.info(
         "Tip: rerun with `--dry-run` to preview settings or `--export` to save param_store and metadata."

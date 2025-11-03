@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover - runtime guard
 
 DEFAULT_MODELS_DIR = Path(__file__).resolve().parent / "models"
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class PredictionEntry:
@@ -78,6 +81,9 @@ class BNNAnalysis:
     suggested_probability: float
     suggested_std: float
     mc_samples: int
+    mean_probability: float
+    probability_std: float
+    selection_reason: str
 
 
 def discover_latest_model(models_dir: Path) -> Optional[Tuple[Path, Path]]:
@@ -152,6 +158,9 @@ def load_bnn_artifacts(
     guide = StateBNNGuide(model, device=device).to(device)
 
     pyro.get_param_store().load(str(param_store_path), map_location=device)
+
+    model.set_kl_scale(1.0)
+    guide.set_kl_scale(1.0)
 
     history = metadata.get("history", {})
     artifacts = TrainingArtifacts(
@@ -421,6 +430,13 @@ class ConsoleUnoBNNInterface:
             print(
                 f"[AllyBot] move diagnostic: {describe_token(token)} | Current color: {current_color.value.title()}"
             )
+            logger.info(
+                "AllyBot move | token=%s | color=%s | reason=%s | prob=%.3f",
+                describe_token(token),
+                current_color.value,
+                action.info.get("selection_reason", "n/a"),
+                action.info.get("bnn_probability", float("nan")),
+            )
 
         if action.action_type == ActionType.PLAY and action.card is not None:
             chosen_color = action.chosen_color
@@ -539,19 +555,24 @@ class ConsoleUnoBNNInterface:
         )
         print(
             "  Confidence: "
-            f"{analysis.suggested_probability:.2%} ± {analysis.suggested_std:.2%}"
+            f"{analysis.suggested_probability:.2%} +/- {analysis.suggested_std:.2%}"
             f" | MC={analysis.mc_samples}"
         )
         suggestion_desc = describe_token(analysis.suggested_token)
         print(f"  Suggested action: {suggestion_desc}")
+        print(
+            "  Distribution summary: "
+            f"mu={analysis.mean_probability:.2%} +/- {analysis.probability_std:.2%}"
+            f" | Selection trigger: {analysis.selection_reason}"
+        )
 
-        print("  Top predictions (mean ± std):")
-        for entry in analysis.entries:
+        print("  Top predictions (mean +/- std):")
+        for entry in analysis.entries[:3]:
             status = "valid" if entry.is_valid else "not in hand"
             print(
                 "    "
                 f"{describe_token(entry.token):<40} "
-                f"{entry.probability:>8.2%} ± {entry.std_dev:>6.2%} ({status})"
+                f"{entry.probability:>8.2%} +/- {entry.std_dev:>6.2%} ({status})"
             )
 
     def _analyze_state_with_bnn(self, state: GameState) -> BNNAnalysis:
@@ -602,6 +623,14 @@ class ConsoleUnoBNNInterface:
                 std_probs_masked = std_probs_masked * mask
         else:
             std_probs_masked = torch.zeros_like(mean_probs_masked)
+
+        if valid_indices:
+            prob_slice = mean_probs_masked[valid_indices]
+            prob_mean = float(prob_slice.mean().item())
+            prob_std = float(prob_slice.std(unbiased=False).item())
+        else:
+            prob_mean = float(mean_probs.mean().item())
+            prob_std = float(mean_probs.std(unbiased=False).item())
 
         top_candidates = torch.argsort(mean_probs_masked, descending=True)
         entries: List[PredictionEntry] = []
@@ -664,6 +693,27 @@ class ConsoleUnoBNNInterface:
             if std_probs_masked is not None and 0 <= idx < std_probs_masked.shape[0]:
                 suggested_std = float(std_probs_masked[idx].item())
 
+        suggested_probability = float(
+            suggestion.info.get("bnn_probability", suggested_probability)
+        )
+        info_std = suggestion.info.get("bnn_probability_std")
+        if info_std is not None:
+            suggested_std = float(info_std)
+        selection_reason = suggestion.info.get("selection_reason", "probability")
+
+        if logger.isEnabledFor(logging.DEBUG):
+            top_debug = ", ".join(
+                f"{describe_token(entry.token)}={entry.probability:.2%}"
+                for entry in entries[:3]
+            )
+            logger.debug(
+                "BNN analysis | entropy=%.3f | MI=%.3f | reason=%s | top=%s",
+                entropy,
+                mutual_information,
+                selection_reason,
+                top_debug,
+            )
+
         return BNNAnalysis(
             scenario_type=scenario_type,
             entropy=entropy,
@@ -674,6 +724,9 @@ class ConsoleUnoBNNInterface:
             suggested_probability=suggested_probability,
             suggested_std=suggested_std,
             mc_samples=self.mc_samples,
+            mean_probability=prob_mean,
+            probability_std=prob_std,
+            selection_reason=selection_reason,
         )
 
     def _display_round_results(self, state: GameState) -> None:

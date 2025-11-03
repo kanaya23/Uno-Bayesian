@@ -268,11 +268,14 @@ class UnoEngine:
         if state.pending_action and state.pending_action.type == PendingActionType.DRAWN_CARD_PLAY_WINDOW:
             raise InvalidMoveError("Player must resolve drawn-card window first.")
 
-        if self.get_valid_moves(state, player_id):
-            raise InvalidMoveError("Player must play a valid card before drawing.")
+        had_valid_moves = bool(self.get_valid_moves(state, player_id))
 
         cloned_state = self._clone_state(state)
         drawn_card = self._draw_single(cloned_state, player_index)
+
+        if had_valid_moves:
+            self._advance_turn(cloned_state, 1)
+            return cloned_state
 
         current_color = self._current_color(cloned_state)
         top_card = cloned_state.discard_pile[-1]

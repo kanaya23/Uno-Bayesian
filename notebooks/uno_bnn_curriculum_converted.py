@@ -900,7 +900,8 @@ class StateEncoder:
 
         # Player-centric features (ordered P0..P3)
         for pid in PLAYER_SEQUENCE:
-            hand = next(player.hand for player in state.players if player.player_id == pid)
+            player = next((player for player in state.players if player.player_id == pid), None)
+            hand = list(player.hand) if player is not None else []
             features.append(len(hand) / 20.0)
             color_counts = {color: 0 for color in STANDARD_COLORS}
             special_counts = {stype: 0 for stype in SPECIAL_TYPES}
@@ -1606,6 +1607,7 @@ class BNNBot(BotPolicy):
             use_dropout=True,
         )
         mean_probs = result["mean_probs"][0]
+        mean_probs_flat = mean_probs.reshape(-1)
         entropy = result["predictive_entropy"][0].item()
         mutual_info = result["mutual_information"][0].item()
 
@@ -1622,7 +1624,13 @@ class BNNBot(BotPolicy):
                 candidate_idx = self.artifacts.action_encoder.lookup.get(candidate_token)
                 if candidate_idx is None:
                     continue
-                ranked.append((mean_probs[candidate_idx].item(), candidate))
+                try:
+                    idx = int(candidate_idx)
+                except (TypeError, ValueError):
+                    continue
+                if idx < 0 or idx >= mean_probs_flat.shape[0]:
+                    continue
+                ranked.append((float(mean_probs_flat[idx].item()), candidate))
             if ranked:
                 ranked.sort(key=lambda pair: pair[0], reverse=True)
                 action = ranked[0][1]

@@ -1,0 +1,13 @@
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted | Preset 'quick' applied -> scenarios=1200, epochs=12, batch=96, lr=0.004
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted | Using device: cpu
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted | Dry run requested; skipping dataset generation and training.
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted | Run summary
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted |   mode: CLASSIC_2V2
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted |   device: auto
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted |   scenarios: 1200 | epochs: 12 | batch: 96
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted |   learning_rate: 0.004 | clip_norm: 10.00
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted |   validation_split: 0.10 | workers: 2
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted |   progress_bar: False | log_batches: False (interval=10)
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted |   metrics_csv: in-memory (CSV logging disabled)
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted |   text_log: training_logs\local_CLASSIC_2V2_20251103-160215.log
+2025-11-03 16:02:15 | INFO | notebooks.uno_bnn_curriculum_converted | Re-run without --dry-run to start training.

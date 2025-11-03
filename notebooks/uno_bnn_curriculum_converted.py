@@ -539,12 +539,24 @@ class BotPolicy(abc.ABC):
                     actions.append(BotAction(ActionType.PLAY, card=card, chosen_color=color))
             else:
                 actions.append(BotAction(ActionType.PLAY, card=card))
-        if not actions:
-            pending = state.pending_action
-            if pending and pending.type == PendingActionType.DRAW_STACK:
-                actions.append(BotAction(ActionType.DRAW))
-            else:
-                actions.append(BotAction(ActionType.DRAW))
+        pending = state.pending_action
+        pass_allowed = False
+        draw_allowed = True
+        if pending:
+            if pending.type == PendingActionType.DRAWN_CARD_PLAY_WINDOW and pending.player_id == player_id:
+                pass_allowed = True
+                draw_allowed = False
+            elif pending.type == PendingActionType.COLOR_CHOICE and pending.player_id == player_id:
+                draw_allowed = False
+
+        if pass_allowed:
+            actions.append(BotAction(ActionType.PASS))
+
+        if draw_allowed:
+            actions.append(BotAction(ActionType.DRAW))
+        elif not actions:
+            # Fallback safeguard - drawing keeps the loop progressing even if heuristics disagree.
+            actions.append(BotAction(ActionType.DRAW))
         return actions
 
     @abc.abstractmethod
@@ -1122,6 +1134,7 @@ class StateBayesianNN(PyroModule):
     ) -> None:
         super().__init__()
         device = device or torch.device("cpu")
+        self.kl_scale = 1.0
         self.backbone = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
@@ -1157,12 +1170,16 @@ class StateBayesianNN(PyroModule):
     def forward(self, x: torch.Tensor, y: Optional[torch.Tensor] = None) -> torch.Tensor:
         pyro.module("backbone", self.backbone)
         features = self.backbone(x)
-        logits = self.classifier(features)
+        with pyro.poutine.scale(scale=self.kl_scale):
+            logits = self.classifier(features)
         log_probs = F.log_softmax(logits, dim=-1)
         pyro.deterministic("logits", logits)
         with pyro.plate("data", x.size(0)):
             pyro.sample("obs", dist.Categorical(logits=log_probs), obs=y)
         return log_probs
+
+    def set_kl_scale(self, scale: float) -> None:
+        self.kl_scale = float(max(scale, 0.0))
 
 
 class StateBNNGuide(PyroModule):
@@ -1172,6 +1189,7 @@ class StateBNNGuide(PyroModule):
         num_classes = model.classifier.out_features
         device = device or next(model.parameters()).device
         self.backbone = model.backbone
+        self.kl_scale = 1.0
         self.weight_loc = PyroParam(torch.zeros(num_classes, hidden_dim, device=device))
         self.weight_scale = PyroParam(
             torch.ones(num_classes, hidden_dim, device=device),
@@ -1185,14 +1203,18 @@ class StateBNNGuide(PyroModule):
 
     def forward(self, x: torch.Tensor, y: Optional[torch.Tensor] = None) -> None:
         pyro.module("backbone", self.backbone)
-        pyro.sample(
-            "classifier.weight",
-            dist.Normal(self.weight_loc, self.weight_scale).to_event(2),
-        )
-        pyro.sample(
-            "classifier.bias",
-            dist.Normal(self.bias_loc, self.bias_scale).to_event(1),
-        )
+        with pyro.poutine.scale(scale=self.kl_scale):
+            pyro.sample(
+                "classifier.weight",
+                dist.Normal(self.weight_loc, self.weight_scale).to_event(2),
+            )
+            pyro.sample(
+                "classifier.bias",
+                dist.Normal(self.bias_loc, self.bias_scale).to_event(1),
+            )
+
+    def set_kl_scale(self, scale: float) -> None:
+        self.kl_scale = float(max(scale, 0.0))
 
 # %% [code cell 9]
 @dataclass
@@ -1211,6 +1233,9 @@ class TrainingConfig:
     num_workers: int = field(default_factory=lambda: DEFAULT_NUM_WORKERS)
     log_batches: bool = False
     batch_log_interval: int = 10
+    kl_beta_start: float = 0.3
+    kl_beta_end: float = 1.0
+    kl_warmup_epochs: int = 10
 
 
 @dataclass
@@ -1274,6 +1299,7 @@ def train_bnn(
         "val_loss": [],
         "val_acc": [],
         "epoch_seconds": [],
+        "kl_beta": [],
     }
 
     base_name = config.run_name or "bnn_training"
@@ -1307,6 +1333,15 @@ def train_bnn(
             f"batch_size={config.batch_size} lr={config.learning_rate:.2e} workers={config.num_workers}"
         )
 
+    def _compute_beta(epoch_index: int) -> float:
+        if config.kl_beta_start >= config.kl_beta_end or config.kl_warmup_epochs <= 0:
+            return float(config.kl_beta_end)
+        progress = max(0, epoch_index - 1) / max(1, config.kl_warmup_epochs - 1)
+        progress = min(progress, 1.0)
+        return float(
+            config.kl_beta_start + (config.kl_beta_end - config.kl_beta_start) * progress
+        )
+
     epoch_numbers = range(1, config.num_epochs + 1)
     progress = None
     try:
@@ -1317,6 +1352,9 @@ def train_bnn(
             epoch_iterator = epoch_numbers
 
         for epoch in epoch_iterator:
+            current_beta = _compute_beta(epoch)
+            model.set_kl_scale(current_beta)
+            guide.set_kl_scale(current_beta)
             model.train()
             if use_cuda:
                 torch.cuda.synchronize()
@@ -1363,6 +1401,7 @@ def train_bnn(
             val_acc = val_correct / max(1, val_total)
             history["val_loss"].append(val_loss)
             history["val_acc"].append(val_acc)
+            history["kl_beta"].append(current_beta)
 
             if use_cuda:
                 torch.cuda.synchronize()
@@ -1380,7 +1419,7 @@ def train_bnn(
             should_log = config.log_every <= 1 or epoch % config.log_every == 0 or epoch == config.num_epochs
             message = (
                 f"[{run_label}] Epoch {epoch:03d}/{config.num_epochs:03d} "
-                f"| train {epoch_loss:.4f} | val {val_loss:.4f} | acc {val_acc:.3f} | {epoch_time:.2f}s"
+                f"| train {epoch_loss:.4f} | val {val_loss:.4f} | acc {val_acc:.3f} | beta {current_beta:.2f} | {epoch_time:.2f}s"
             )
             if config.log_to_console and should_log:
                 logger.info(message)
@@ -1406,6 +1445,9 @@ def train_bnn(
         if log_file is not None:
             log_file.close()
 
+    model.set_kl_scale(1.0)
+    guide.set_kl_scale(1.0)
+
     metadata = {
         "run_id": run_label,
         "device": str(device),
@@ -1413,6 +1455,12 @@ def train_bnn(
         "val_samples": val_size,
         "batch_size": config.batch_size,
         "learning_rate": config.learning_rate,
+    }
+
+    metadata["kl_schedule"] = {
+        "beta_start": config.kl_beta_start,
+        "beta_end": config.kl_beta_end,
+        "warmup_epochs": config.kl_warmup_epochs,
     }
 
     artifacts = TrainingArtifacts(
@@ -1458,6 +1506,7 @@ def mc_predict(
     logits = samples["logits"]  # [num_samples, batch, num_classes]
     probs = logits.softmax(dim=-1)
     mean_probs = probs.mean(dim=0)
+    std_probs = probs.std(dim=0, unbiased=False)
     predictive_entropy = -(mean_probs * mean_probs.clamp(min=1e-8).log()).sum(dim=-1)
     expected_entropy = -(
         probs * probs.clamp(min=1e-8).log()
@@ -1467,6 +1516,7 @@ def mc_predict(
 
     return {
         "mean_probs": mean_probs.detach().cpu(),
+        "std_probs": std_probs.detach().cpu(),
         "predictive_entropy": predictive_entropy.detach().cpu(),
         "mutual_information": mutual_information.detach().cpu(),
         "predictions": predictions.detach().cpu(),
@@ -1582,12 +1632,16 @@ class BNNBot(BotPolicy):
         rng: Optional[random.Random] = None,
         uncertainty_threshold: float = 0.25,
         mc_samples: int = 40,
+        exploration_mi_threshold: float = 0.6,
+        exploitation_entropy_threshold: float = 3.5,
     ) -> None:
         super().__init__("BNNBot", rng=rng)
         self.artifacts = artifacts
         self.persona_hint = persona_hint if persona_hint in BOT_ORDER else BOT_ORDER[0]
         self.uncertainty_threshold = uncertainty_threshold
         self.mc_samples = mc_samples
+        self.mi_explore_threshold = exploration_mi_threshold
+        self.entropy_exploit_threshold = exploitation_entropy_threshold
 
     def decide(self, engine: UnoEngine, state: GameState, player_id: str) -> BotAction:
         scenario_type = self._infer_scenario_type(state, player_id)
@@ -1608,32 +1662,95 @@ class BNNBot(BotPolicy):
         )
         mean_probs = result["mean_probs"][0]
         mean_probs_flat = mean_probs.reshape(-1)
+        std_probs = result.get("std_probs")
+        std_probs_flat = None
+        if std_probs is not None:
+            std_probs_flat = std_probs[0].reshape(-1)
         entropy = result["predictive_entropy"][0].item()
         mutual_info = result["mutual_information"][0].item()
 
-        token_idx = int(result["predictions"][0].item())
-        token = self.artifacts.action_encoder.decode(token_idx)
-        action = self.artifacts.action_encoder.token_to_action(token, state, player_id)
+        valid_actions = self.enumerate_actions(engine, state, player_id)
+        if not valid_actions:
+            fallback = BotAction(ActionType.DRAW)
+            fallback.info.update(
+                {
+                    "bnn_entropy": entropy,
+                    "bnn_mutual_information": mutual_info,
+                    "persona_hint": self.persona_hint,
+                    "scenario_type": scenario_type.value,
+                    "selection_reason": "no_actions",
+                }
+            )
+            return fallback
 
-        if action.action_type == ActionType.DRAW:
-            # fallback to valid move with highest probability mass
-            valid_actions = self.enumerate_actions(engine, state, player_id)
-            ranked = []
-            for candidate in valid_actions:
-                candidate_token = self.artifacts.action_encoder._to_token(candidate)
-                candidate_idx = self.artifacts.action_encoder.lookup.get(candidate_token)
-                if candidate_idx is None:
-                    continue
-                try:
-                    idx = int(candidate_idx)
-                except (TypeError, ValueError):
-                    continue
-                if idx < 0 or idx >= mean_probs_flat.shape[0]:
-                    continue
-                ranked.append((float(mean_probs_flat[idx].item()), candidate))
-            if ranked:
-                ranked.sort(key=lambda pair: pair[0], reverse=True)
-                action = ranked[0][1]
+        mask = torch.zeros_like(mean_probs_flat)
+        candidates: List[Dict[str, Any]] = []
+        for action in valid_actions:
+            token = self.artifacts.action_encoder._to_token(action)
+            idx = self.artifacts.action_encoder.lookup.get(token)
+            if idx is None:
+                continue
+            idx_int = int(idx)
+            if idx_int < 0 or idx_int >= mean_probs_flat.shape[0]:
+                continue
+            probability = float(mean_probs_flat[idx_int].item())
+            mask[idx_int] = 1.0
+            std_val = None
+            if std_probs_flat is not None and 0 <= idx_int < std_probs_flat.shape[0]:
+                std_val = float(std_probs_flat[idx_int].item())
+            candidates.append(
+                {
+                    "action": action,
+                    "token": token,
+                    "idx": idx_int,
+                    "raw_prob": probability,
+                    "std": std_val,
+                }
+            )
+
+        if not candidates:
+            token_idx = int(result["predictions"][0].item())
+            token = self.artifacts.action_encoder.decode(token_idx)
+            fallback = self.artifacts.action_encoder.token_to_action(token, state, player_id)
+            fallback.info.update(
+                {
+                    "bnn_entropy": entropy,
+                    "bnn_mutual_information": mutual_info,
+                    "persona_hint": self.persona_hint,
+                    "scenario_type": scenario_type.value,
+                    "selection_reason": "encoder_miss",
+                }
+            )
+            return fallback
+
+        masked_probs = mean_probs_flat * mask
+        normalization = float(masked_probs.sum().item())
+        if normalization <= 0:
+            uniform = 1.0 / len(candidates)
+            for candidate in candidates:
+                candidate["prob"] = uniform
+        else:
+            masked_probs = masked_probs / masked_probs.sum()
+            for candidate in candidates:
+                candidate["prob"] = float(masked_probs[candidate["idx"]].item())
+
+        candidates.sort(key=lambda item: item["prob"], reverse=True)
+
+        selection_reason = "probability"
+        selected = candidates[0]
+        if mutual_info > self.mi_explore_threshold:
+            exploratory = self._select_exploration_candidate(state, candidates)
+            if exploratory is not None:
+                selected = exploratory
+                selection_reason = "explore_high_mi"
+        elif entropy < self.entropy_exploit_threshold:
+            exploit = self._select_exploitation_candidate(candidates)
+            if exploit is not None:
+                selected = exploit
+                selection_reason = "exploit_low_entropy"
+
+        action = selected["action"]
+        has_play_option = any(candidate["action"].action_type == ActionType.PLAY for candidate in candidates)
 
         action.info.update(
             {
@@ -1641,9 +1758,95 @@ class BNNBot(BotPolicy):
                 "bnn_mutual_information": mutual_info,
                 "persona_hint": self.persona_hint,
                 "scenario_type": scenario_type.value,
+                "bnn_probability": selected.get("prob", 0.0),
+                "bnn_probability_raw": selected.get("raw_prob", 0.0),
+                "bnn_probability_std": selected.get("std"),
+                "selection_reason": selection_reason,
+                "mi_threshold": self.mi_explore_threshold,
+                "entropy_threshold": self.entropy_exploit_threshold,
+                "mc_samples": self.mc_samples,
+                "candidate_count": len(candidates),
+                "probability_normalization": "uniform" if normalization <= 0 else "masked",
+                "bnn_token": selected["token"],
             }
         )
+
+        if action.action_type == ActionType.DRAW:
+            action.info["forfeits_turn"] = has_play_option
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "BNNBot decision | player=%s | token=%s | reason=%s | prob=%.4f | entropy=%.3f | MI=%.3f",
+                player_id,
+                selected["token"],
+                selection_reason,
+                action.info.get("bnn_probability", 0.0),
+                entropy,
+                mutual_info,
+            )
+
         return action
+
+    def _select_exploration_candidate(
+        self, state: GameState, candidates: Sequence[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        current_color = state.current_color or state.discard_pile[-1].color
+        same_color_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["action"].action_type == ActionType.PLAY
+            and candidate["action"].card is not None
+            and candidate["action"].card.color == current_color
+        ]
+        if same_color_candidates:
+            return max(same_color_candidates, key=lambda cand: cand["prob"])
+
+        draw_candidates = [
+            candidate for candidate in candidates if candidate["action"].action_type == ActionType.DRAW
+        ]
+        if draw_candidates:
+            return max(draw_candidates, key=lambda cand: cand["prob"])
+
+        pass_candidates = [
+            candidate for candidate in candidates if candidate["action"].action_type == ActionType.PASS
+        ]
+        if pass_candidates:
+            return max(pass_candidates, key=lambda cand: cand["prob"])
+
+        return None
+
+    def _select_exploitation_candidate(
+        self, candidates: Sequence[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        play_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["action"].action_type == ActionType.PLAY and candidate["action"].card is not None
+        ]
+        if not play_candidates:
+            return None
+
+        play_candidates.sort(
+            key=lambda cand: (
+                self._action_impact_score(cand["action"]),
+                cand["prob"],
+            ),
+            reverse=True,
+        )
+        return play_candidates[0]
+
+    def _action_impact_score(self, action: BotAction) -> float:
+        if action.action_type != ActionType.PLAY or action.card is None:
+            return 0.0
+        priority = {
+            CardType.WILD_DRAW_FOUR: 6.0,
+            CardType.WILD: 5.0,
+            CardType.DISCARD_ALL: 4.5,
+            CardType.DRAW_TWO: 4.0,
+            CardType.SKIP: 3.0,
+            CardType.REVERSE: 2.0,
+        }
+        return priority.get(action.card.type, 1.0)
 
     def _infer_scenario_type(self, state: GameState, player_id: str) -> ScenarioType:
         hand = next(player.hand for player in state.players if player.player_id == player_id)

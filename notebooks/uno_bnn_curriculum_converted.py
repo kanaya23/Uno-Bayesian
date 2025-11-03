@@ -2056,6 +2056,62 @@ def parse_scenario_mix(argument: Optional[str]) -> Optional[Dict[ScenarioType, f
     return mix
 
 
+def _should_override(arg_namespace: argparse.Namespace, parser: argparse.ArgumentParser, field: str) -> bool:
+    return getattr(arg_namespace, field) == parser.get_default(field)
+
+
+def _apply_preset(arg_namespace: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if not arg_namespace.preset:
+        return
+    presets = {
+        "quick": {
+            "num_scenarios": 1200,
+            "epochs": 12,
+            "batch_size": 96,
+            "learning_rate": 4e-3,
+            "progress": False,
+        },
+        "balanced": {
+            "num_scenarios": 2000,
+            "epochs": 20,
+            "batch_size": 128,
+            "learning_rate": 3e-3,
+            "progress": True,
+        },
+        "max": {
+            "num_scenarios": 3200,
+            "epochs": 30,
+            "batch_size": 192,
+            "learning_rate": 2.5e-3,
+            "progress": True,
+        },
+    }
+    overrides = presets[arg_namespace.preset]
+    for field, value in overrides.items():
+        if _should_override(arg_namespace, parser, field):
+            setattr(arg_namespace, field, value)
+
+
+def _log_configuration_summary(args: argparse.Namespace, *, log_file: Optional[Path], csv_path: Optional[Path]) -> None:
+    logger.info("Run summary")
+    logger.info("  mode: %s", args.mode)
+    logger.info("  device: %s", args.device)
+    logger.info("  scenarios: %s | epochs: %s | batch: %s", args.num_scenarios, args.epochs, args.batch_size)
+    logger.info("  learning_rate: %.4g | clip_norm: %.2f", args.learning_rate, args.clip_norm)
+    logger.info("  validation_split: %.2f | workers: %d", args.validation_split, args.num_workers)
+    logger.info("  progress_bar: %s | log_batches: %s (interval=%d)", args.progress, args.log_batches, args.batch_log_interval)
+    if csv_path:
+        logger.info("  metrics_csv: %s", csv_path)
+    else:
+        logger.info("  metrics_csv: in-memory (CSV logging disabled)")
+    if log_file:
+        logger.info("  text_log: %s", log_file)
+    else:
+        logger.info("  text_log: disabled")
+    if args.export:
+        logger.info("  export_dir: %s | model_tag: %s", args.output_dir, args.model_tag or "<auto>")
+
+
 def run_cli() -> None:
     parser = argparse.ArgumentParser(
         description="Train the UNO Bayesian neural network locally with configurable logging.",
@@ -2117,8 +2173,22 @@ def run_cli() -> None:
         help="Directory to store exported artifacts when --export is used.",
     )
     parser.add_argument("--model-tag", type=str, default=None, help="Tag/name for exported artifacts.")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=["quick", "balanced", "max"],
+        default=None,
+        help="Apply a friendly preset (quick=fast preview, balanced=default, max=longer training).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the resolved configuration and exit without training.",
+    )
 
     args = parser.parse_args()
+
+    _apply_preset(args, parser)
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_name = args.run_name or f"local_{args.mode}_{timestamp}"
@@ -2135,7 +2205,27 @@ def run_cli() -> None:
 
     configure_root_logger(args.log_level, log_file_path)
 
+    if args.preset:
+        logger.info(
+            "Preset '%s' applied -> scenarios=%d, epochs=%d, batch=%d, lr=%.4g",
+            args.preset,
+            args.num_scenarios,
+            args.epochs,
+            args.batch_size,
+            args.learning_rate,
+        )
+
+    device = resolve_device(args.device)
+    logger.info("Using device: %s", device)
+
+    if args.dry_run:
+        logger.info("Dry run requested; skipping dataset generation and training.")
+        _log_configuration_summary(args, log_file=log_file_path, csv_path=None)
+        logger.info("Re-run without --dry-run to start training.")
+        return
+
     logger.info("Preparing synthetic dataset...")
+    dataset_start = time.perf_counter()
     scenario_mix = parse_scenario_mix(args.scenario_mix)
     dataset, labeled_examples, state_encoder, action_encoder = build_synthetic_dataset(
         mode=mode,
@@ -2144,18 +2234,17 @@ def run_cli() -> None:
         rng_seed=args.rng_seed,
         include_random_bot=args.include_random_bot,
     )
+    dataset_seconds = time.perf_counter() - dataset_start
     logger.info(
-        "Dataset ready | samples=%d | features=%d | labels=%d",
+        "Dataset ready | samples=%d | features=%d | labels=%d | %.1fs",
         len(dataset),
         dataset.features.shape[1],
         len(action_encoder.lookup),
+        dataset_seconds,
     )
     logger.debug("Labeled persona decisions: %d", len(labeled_examples))
 
     pyro.clear_param_store()
-
-    device = resolve_device(args.device)
-    logger.info("Using device: %s", device)
 
     training_config = TrainingConfig(
         num_epochs=args.epochs,
@@ -2187,6 +2276,12 @@ def run_cli() -> None:
         artifacts.history["train_loss"][-1],
         artifacts.history["val_loss"][-1],
         artifacts.history["val_acc"][-1],
+    )
+
+    _log_configuration_summary(args, log_file=log_file_path, csv_path=artifacts.log_path)
+
+    logger.info(
+        "Tip: rerun with `--dry-run` to preview settings or `--export` to save param_store and metadata."
     )
 
     if args.export:

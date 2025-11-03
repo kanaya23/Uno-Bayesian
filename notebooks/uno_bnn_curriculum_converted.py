@@ -1777,9 +1777,97 @@ def _map_metadata_colors(
     return {key: _map_nested_colors(value, mapping, card_cache) for key, value in metadata.items()}
 
 
+def _invert_color_mapping(mapping: Dict[Color, Color]) -> Dict[Color, Color]:
+    return {value: key for key, value in mapping.items()}
+
+
+def _map_token_colors(token: str, mapping: Dict[Color, Color]) -> str:
+    if token in {"DRAW", "PASS"}:
+        return token
+
+    parts = token.split("_")
+
+    def _map_part(part: str) -> str:
+        color = COLOR_VALUE_TO_ENUM.get(part)
+        if color is None:
+            return part
+        return mapping.get(color, color).value
+
+    mapped_parts = [_map_part(part) for part in parts]
+    return "_".join(mapped_parts)
+
+
+def _teammate_for(player_id: str) -> str:
+    team_index = TEAM_MAP[player_id]
+    for candidate, index in TEAM_MAP.items():
+        if candidate != player_id and index == team_index:
+            return candidate
+    raise KeyError(f"No teammate registered for player id '{player_id}'")
+
+
 def _map_parameters(params: ScenarioParameters, mapping: Dict[Color, Color]) -> ScenarioParameters:
     color_bias = _map_color(params.color_bias, mapping)
     return dataclasses.replace(params, color_bias=color_bias)
+
+
+def _build_unplayable_example(
+    forge: ScenarioForge,
+    *,
+    mode: GameMode,
+    target_player: str,
+) -> ScenarioExample:
+    top_color = forge.rng.choice(STANDARD_COLORS)
+    top_number = forge.rng.randint(0, 9)
+    top_card = forge._make_number_card(top_color, top_number)
+
+    other_colors = [color for color in STANDARD_COLORS if color != top_color]
+    target_hand: List[Card] = []
+    attempts = 0
+    while len(target_hand) < 6:
+        attempts += 1
+        if attempts > 200:
+            raise RuntimeError("Failed to synthesize an unplayable hand without matching cards.")
+        color = forge.rng.choice(other_colors)
+        number = forge.rng.randint(0, 9)
+        if number == top_number:
+            continue
+        target_hand.append(forge._make_number_card(color, number))
+
+    teammate = _teammate_for(target_player)
+    hands: Dict[str, Sequence[Card]] = {
+        target_player: target_hand,
+        teammate: forge._make_random_hand(mode, hand_size=forge.rng.randint(4, 7)),
+    }
+
+    for pid in PLAYER_SEQUENCE:
+        if pid in hands:
+            continue
+        hands[pid] = forge._make_random_hand(mode, hand_size=forge.rng.randint(4, 7))
+
+    state = forge._assemble_state(
+        mode=mode,
+        hands=hands,
+        discard=[top_card],
+        current_player_index=PLAYER_SEQUENCE.index(target_player),
+        current_color=top_color,
+    )
+
+    params = ScenarioParameters(
+        scenario_type=ScenarioType.SETUP,
+        mode=mode,
+        target_player=target_player,
+        distance_to_victory=len(target_hand),
+        color_bias=top_color,
+    )
+
+    metadata = {
+        "constructed": True,
+        "reason": "no_play_options",
+        "top_color": top_color.value,
+        "top_number": top_number,
+    }
+
+    return ScenarioExample(state, target_player, ScenarioType.SETUP, params, metadata)
 
 
 def _apply_color_permutation(
@@ -2318,6 +2406,337 @@ def evaluate_state_with_bnn(
         "mc": mc,
     }
 
+
+@dataclass
+class PragmaticCheckResult:
+    name: str
+    passed: bool
+    metrics: Dict[str, float]
+    thresholds: Dict[str, float]
+    detail: Optional[str] = None
+
+
+def _run_draw_vs_play_sanity(
+    artifacts: TrainingArtifacts,
+    *,
+    bnn_bot: BNNBot,
+    engine: UnoEngine,
+    forge: ScenarioForge,
+    samples: int,
+    threshold: float,
+    base_seed: int,
+) -> PragmaticCheckResult:
+    plays = 0
+    total = 0
+    for index in range(samples):
+        example = forge.generate(
+            ScenarioParameters(
+                scenario_type=ScenarioType.FINISHER,
+                target_player="P0",
+                mode=GameMode.CLASSIC_2V2,
+            )
+        )
+        player_id = example.target_player
+        state = example.state
+        if not engine.get_valid_moves(state, player_id):
+            continue
+        pyro.set_rng_seed(base_seed + index)
+        action = bnn_bot.decide(engine, state, player_id)
+        if action.action_type == ActionType.PLAY:
+            plays += 1
+        total += 1
+
+    if total == 0:
+        raise RuntimeError("Draw-vs-Play sanity check could not sample any playable states.")
+
+    rate = plays / total
+    return PragmaticCheckResult(
+        name="draw_vs_play_sanity",
+        passed=rate >= threshold,
+        metrics={"play_rate": rate, "sample_count": float(total)},
+        thresholds={"min_play_rate": threshold},
+    )
+
+
+def _run_entropy_check(
+    artifacts: TrainingArtifacts,
+    *,
+    bnn_bot: BNNBot,
+    forge: ScenarioForge,
+    samples: int,
+    mean_threshold: float,
+    base_seed: int,
+    mc_samples: int,
+) -> PragmaticCheckResult:
+    entropies: List[float] = []
+    scenario_choices = list(ScenarioType)
+
+    for index in range(samples):
+        scenario_type = forge.rng.choice(scenario_choices)
+        example = forge.generate(
+            ScenarioParameters(
+                scenario_type=scenario_type,
+                target_player="P0",
+                mode=GameMode.CLASSIC_2V2,
+            )
+        )
+        player_id = example.target_player
+        state = example.state
+        inferred_type = bnn_bot._infer_scenario_type(state, player_id)
+        metadata = bnn_bot._infer_metadata(state, player_id)
+        pyro.set_rng_seed(base_seed + 1000 + index)
+        evaluation = evaluate_state_with_bnn(
+            artifacts,
+            state=state,
+            target_player=player_id,
+            persona_name=bnn_bot.persona_hint,
+            scenario_type=inferred_type,
+            metadata=metadata,
+            num_samples=mc_samples,
+        )
+        entropy = float(evaluation["mc"]["predictive_entropy"][0].item())
+        entropies.append(entropy)
+
+    if not entropies:
+        raise RuntimeError("Entropy check did not collect any samples.")
+
+    mean_entropy = float(np.mean(entropies))
+    std_entropy = float(np.std(entropies))
+    return PragmaticCheckResult(
+        name="entropy_calibration",
+        passed=mean_entropy < mean_threshold,
+        metrics={
+            "mean_entropy": mean_entropy,
+            "std_entropy": std_entropy,
+            "sample_count": float(len(entropies)),
+        },
+        thresholds={"max_mean_entropy": mean_threshold},
+    )
+
+
+def _run_color_symmetry_check(
+    artifacts: TrainingArtifacts,
+    *,
+    bnn_bot: BNNBot,
+    forge: ScenarioForge,
+    samples: int,
+    tolerance: float,
+    success_threshold: float,
+    base_seed: int,
+    mc_samples: int,
+) -> PragmaticCheckResult:
+    mappings = _cyclic_color_mappings()
+    if not mappings:
+        raise RuntimeError("Color symmetry mappings are not defined.")
+    mapping = mappings[0]
+    inverse_mapping = _invert_color_mapping(mapping)
+
+    successes = 0
+    total = 0
+    probability_deltas: List[float] = []
+
+    for index in range(samples):
+        example = forge.generate(
+            ScenarioParameters(
+                scenario_type=forge.rng.choice(list(ScenarioType)),
+                target_player="P0",
+                mode=GameMode.CLASSIC_2V2,
+            )
+        )
+        player_id = example.target_player
+        state = example.state
+        inferred_type = bnn_bot._infer_scenario_type(state, player_id)
+        metadata = bnn_bot._infer_metadata(state, player_id)
+
+        pyro.set_rng_seed(base_seed + 2000 + index)
+        original_eval = evaluate_state_with_bnn(
+            artifacts,
+            state=state,
+            target_player=player_id,
+            persona_name=bnn_bot.persona_hint,
+            scenario_type=inferred_type,
+            metadata=metadata,
+            num_samples=mc_samples,
+        )
+
+        mean_probs = original_eval["mc"]["mean_probs"][0]
+        original_index = int(mean_probs.argmax().item())
+        original_token = artifacts.action_encoder.decode(original_index)
+        original_prob = float(mean_probs[original_index].item())
+
+        mirrored_state, card_cache = _clone_state_with_color_map(state, mapping)
+        mirrored_metadata = _map_metadata_colors(metadata, mapping, card_cache)
+
+        pyro.set_rng_seed(base_seed + 3000 + index)
+        mirrored_eval = evaluate_state_with_bnn(
+            artifacts,
+            state=mirrored_state,
+            target_player=player_id,
+            persona_name=bnn_bot.persona_hint,
+            scenario_type=inferred_type,
+            metadata=mirrored_metadata,
+            num_samples=mc_samples,
+        )
+
+        mirrored_probs = mirrored_eval["mc"]["mean_probs"][0]
+        mirrored_index = int(mirrored_probs.argmax().item())
+        mirrored_token = artifacts.action_encoder.decode(mirrored_index)
+        mirrored_prob = float(mirrored_probs[mirrored_index].item())
+
+        canonical_mirrored_token = _map_token_colors(mirrored_token, inverse_mapping)
+        probability_delta = abs(original_prob - mirrored_prob)
+        probability_deltas.append(probability_delta)
+
+        if canonical_mirrored_token == original_token and probability_delta <= tolerance:
+            successes += 1
+        total += 1
+
+    if total == 0:
+        raise RuntimeError("Color symmetry check collected zero samples.")
+
+    success_rate = successes / total
+    mean_delta = float(np.mean(probability_deltas)) if probability_deltas else 0.0
+    return PragmaticCheckResult(
+        name="color_symmetry",
+        passed=success_rate >= success_threshold,
+        metrics={
+            "success_rate": success_rate,
+            "mean_probability_delta": mean_delta,
+            "sample_count": float(total),
+        },
+        thresholds={
+            "min_success_rate": success_threshold,
+            "max_probability_delta": tolerance,
+        },
+    )
+
+
+def _run_overconfidence_check(
+    artifacts: TrainingArtifacts,
+    *,
+    bnn_bot: BNNBot,
+    forge: ScenarioForge,
+    engine: UnoEngine,
+    samples: int,
+    entropy_floor: float,
+    base_seed: int,
+    mc_samples: int,
+) -> PragmaticCheckResult:
+    entropies: List[float] = []
+
+    for index in range(samples):
+        example = _build_unplayable_example(forge, mode=GameMode.CLASSIC_2V2, target_player="P0")
+        player_id = example.target_player
+        state = example.state
+        if engine.get_valid_moves(state, player_id):
+            continue
+        inferred_type = bnn_bot._infer_scenario_type(state, player_id)
+        metadata = bnn_bot._infer_metadata(state, player_id)
+        pyro.set_rng_seed(base_seed + 4000 + index)
+        evaluation = evaluate_state_with_bnn(
+            artifacts,
+            state=state,
+            target_player=player_id,
+            persona_name=bnn_bot.persona_hint,
+            scenario_type=inferred_type,
+            metadata=metadata,
+            num_samples=mc_samples,
+        )
+        entropy = float(evaluation["mc"]["predictive_entropy"][0].item())
+        entropies.append(entropy)
+
+    if not entropies:
+        raise RuntimeError("Overconfidence check could not create unplayable scenarios.")
+
+    min_entropy = float(min(entropies))
+    mean_entropy = float(np.mean(entropies))
+    return PragmaticCheckResult(
+        name="overconfidence_guard",
+        passed=min_entropy >= entropy_floor,
+        metrics={
+            "min_entropy": min_entropy,
+            "mean_entropy": mean_entropy,
+            "sample_count": float(len(entropies)),
+        },
+        thresholds={"min_entropy": entropy_floor},
+    )
+
+
+def run_pragmatic_checks(
+    artifacts: TrainingArtifacts,
+    *,
+    persona: str = "OracleBot",
+    rng_seed: int = 2025,
+    playable_samples: int = 100,
+    entropy_samples: int = 80,
+    symmetry_samples: int = 48,
+    overconfidence_samples: int = 32,
+    symmetry_tolerance: float = 0.05,
+    symmetry_success_rate: float = 0.95,
+    draw_play_threshold: float = 0.80,
+    entropy_mean_threshold: float = 2.5,
+    entropy_floor: float = 3.5,
+    mc_samples: int = 48,
+) -> List[PragmaticCheckResult]:
+    pyro.set_rng_seed(rng_seed)
+    random.seed(rng_seed)
+    np.random.seed(rng_seed % (2**32))
+    torch.manual_seed(rng_seed)
+
+    engine = UnoEngine()
+    forge = ScenarioForge(rng=random.Random(rng_seed + 1))
+    persona_hint = persona if persona in BOT_ORDER else BOT_ORDER[0]
+    bnn_bot = BNNBot(
+        artifacts,
+        persona_hint=persona_hint,
+        rng=random.Random(rng_seed + 2),
+        mc_samples=mc_samples,
+    )
+
+    results = [
+        _run_draw_vs_play_sanity(
+            artifacts,
+            bnn_bot=bnn_bot,
+            engine=engine,
+            forge=ScenarioForge(rng=random.Random(rng_seed + 3)),
+            samples=playable_samples,
+            threshold=draw_play_threshold,
+            base_seed=rng_seed,
+        ),
+        _run_entropy_check(
+            artifacts,
+            bnn_bot=bnn_bot,
+            forge=ScenarioForge(rng=random.Random(rng_seed + 4)),
+            samples=entropy_samples,
+            mean_threshold=entropy_mean_threshold,
+            base_seed=rng_seed,
+            mc_samples=mc_samples,
+        ),
+        _run_color_symmetry_check(
+            artifacts,
+            bnn_bot=bnn_bot,
+            forge=ScenarioForge(rng=random.Random(rng_seed + 5)),
+            samples=symmetry_samples,
+            tolerance=symmetry_tolerance,
+            success_threshold=symmetry_success_rate,
+            base_seed=rng_seed,
+            mc_samples=mc_samples,
+        ),
+        _run_overconfidence_check(
+            artifacts,
+            bnn_bot=bnn_bot,
+            forge=ScenarioForge(rng=random.Random(rng_seed + 6)),
+            engine=engine,
+            samples=overconfidence_samples,
+            entropy_floor=entropy_floor,
+            base_seed=rng_seed,
+            mc_samples=mc_samples,
+        ),
+    ]
+
+    return results
+
+
 # %% [code cell 15]
 @dataclass
 class ActiveLog:
@@ -2782,6 +3201,11 @@ def run_cli() -> None:
         action="store_true",
         help="Print the resolved configuration and exit without training.",
     )
+    parser.add_argument(
+        "--run-checks",
+        action="store_true",
+        help="Run pragmatic BNN/MCTS pairing checks on the trained model.",
+    )
 
     args = parser.parse_args()
 
@@ -2876,6 +3300,32 @@ def run_cli() -> None:
     )
 
     _log_configuration_summary(args, log_file=log_file_path, csv_path=artifacts.log_path)
+
+    if args.run_checks:
+        logger.info("Running pragmatic BNN/MCTS pairing checks...")
+        try:
+            check_results = run_pragmatic_checks(
+                artifacts,
+                persona=args.persona,
+                rng_seed=args.rng_seed,
+            )
+        except Exception as exc:
+            logger.exception("Pragmatic checks aborted: %s", exc)
+            raise
+
+        all_passed = True
+        for result in check_results:
+            status = "PASS" if result.passed else "FAIL"
+            metric_summary = ", ".join(
+                f"{key}={value:.3f}" if isinstance(value, float) else f"{key}={value}"
+                for key, value in result.metrics.items()
+            )
+            logger.info("  [%s] %s | %s", status, result.name, metric_summary)
+            if not result.passed:
+                all_passed = False
+
+        if not all_passed:
+            raise RuntimeError("Pragmatic integration checks failed; see log for metrics.")
 
     logger.info(
         "Tip: rerun with `--dry-run` to preview settings or `--export` to save param_store and metadata."

@@ -581,7 +581,6 @@ class ScenarioForge:
 class ActionType(enum.Enum):
     PLAY = "PLAY"
     DRAW = "DRAW"
-    PASS = "PASS"
 
 
 @dataclass
@@ -607,17 +606,12 @@ class BotPolicy(abc.ABC):
             else:
                 actions.append(BotAction(ActionType.PLAY, card=card))
         pending = state.pending_action
-        pass_allowed = False
         draw_allowed = True
         if pending:
             if pending.type == PendingActionType.DRAWN_CARD_PLAY_WINDOW and pending.player_id == player_id:
-                pass_allowed = True
                 draw_allowed = False
             elif pending.type == PendingActionType.COLOR_CHOICE and pending.player_id == player_id:
                 draw_allowed = False
-
-        if pass_allowed:
-            actions.append(BotAction(ActionType.PASS))
 
         has_play_action = any(action.action_type == ActionType.PLAY for action in actions)
 
@@ -698,11 +692,6 @@ class OracleBot(BotPolicy):
         if action.action_type == ActionType.DRAW:
             try:
                 return self.engine.draw_card(state, player_id)
-            except InvalidMoveError:
-                return state
-        if action.action_type == ActionType.PASS:
-            try:
-                return self.engine.pass_turn(state, player_id)
             except InvalidMoveError:
                 return state
         return state
@@ -906,8 +895,6 @@ class ScenarioLabeler:
                 next_state = self.engine.play_card(state, player_id, action.card, action.chosen_color)
             elif action.action_type == ActionType.DRAW:
                 next_state = self.engine.draw_card(state, player_id)
-            elif action.action_type == ActionType.PASS:
-                next_state = self.engine.pass_turn(state, player_id)
             else:
                 next_state = state
             return next_state, True
@@ -1101,8 +1088,6 @@ class ActionEncoder:
         token = token.upper()
         if token == "DRAW":
             return BotAction(ActionType.DRAW)
-        if token == "PASS":
-            return BotAction(ActionType.PASS)
         if token not in self.lookup:
             raise ValueError(f"Unknown action token '{token}' cannot be decoded.")
 
@@ -1166,8 +1151,6 @@ class ActionEncoder:
     def _to_token(self, action: BotAction) -> str:
         if action.action_type == ActionType.DRAW:
             return "DRAW"
-        if action.action_type == ActionType.PASS:
-            return "PASS"
         card = action.card
         if card is None:
             return "UNKNOWN"
@@ -1185,7 +1168,6 @@ class ActionEncoder:
 
     def _enumerate_tokens(self) -> Iterable[str]:
         yield "DRAW"
-        yield "PASS"
         for color in STANDARD_COLORS:
             for number in range(0, 10):
                 yield f"PLAY_NUMBER_{color.value}_{number}"
@@ -2826,12 +2808,6 @@ class BNNBot(BotPolicy):
         if draw_candidates:
             return max(draw_candidates, key=lambda cand: cand["prob"])
 
-        pass_candidates = [
-            candidate for candidate in candidates if candidate["action"].action_type == ActionType.PASS
-        ]
-        if pass_candidates:
-            return max(pass_candidates, key=lambda cand: cand["prob"])
-
         return None
 
     def _select_exploitation_candidate(
@@ -3237,8 +3213,6 @@ class ActiveCurriculum:
                 return self.engine.play_card(state, player_id, action.card, action.chosen_color), True
             if action.action_type == ActionType.DRAW:
                 return self.engine.draw_card(state, player_id), True
-            if action.action_type == ActionType.PASS:
-                return self.engine.pass_turn(state, player_id), True
         except InvalidMoveError:
             return state, False
         return state, True

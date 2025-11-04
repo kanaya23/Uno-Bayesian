@@ -33,6 +33,7 @@ try:
         ActionEncoder,
         ActionType,
         AggressorBot,
+        ARTIFACT_SCHEMA_VERSION,
         BNNBot,
         BOT_ORDER,
         BotAction,
@@ -42,8 +43,10 @@ try:
         StateBNNGuide,
         StateBayesianNN,
         StateEncoder,
+        action_encoder_signature,
         SupporterBot,
         TrainingArtifacts,
+        state_encoder_signature,
         evaluate_state_with_bnn,
     )
 except ModuleNotFoundError as exc:  # pragma: no cover - runtime guard
@@ -135,16 +138,36 @@ def load_bnn_artifacts(
         int(index): token for index, token in metadata["action_tokens"].items()
     }
 
+    schema_version = metadata.get("schema_version")
+    if schema_version is None:
+        raise RuntimeError("Artifact metadata missing 'schema_version'. Retrain with the latest tooling.")
+    if schema_version != ARTIFACT_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Artifact schema version '{schema_version}' is incompatible with runtime version '{ARTIFACT_SCHEMA_VERSION}'."
+        )
+
     pyro.clear_param_store()
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    state_encoder = StateEncoder()
+    player_order_meta = metadata.get("player_order")
+    state_encoder = StateEncoder(player_order=player_order_meta)
     if state_encoder.feature_size != feature_size:
         raise RuntimeError(
             "Loaded state encoder feature dimension does not match metadata "
             f"(expected {feature_size}, got {state_encoder.feature_size})."
         )
+
+    expected_state_sig = metadata.get("state_encoder_signature")
+    team_map_meta = metadata.get("team_map")
+    computed_state_sig = state_encoder_signature(state_encoder, team_map_meta)
+    if expected_state_sig:
+        if computed_state_sig != expected_state_sig:
+            raise RuntimeError(
+                "State encoder signature mismatch between runtime and artifact metadata."
+            )
+    else:
+        logger.warning("Artifact metadata missing state_encoder_signature; skipping compatibility check.")
 
     action_encoder = ActionEncoder()
     action_encoder.lookup = {}
@@ -153,6 +176,14 @@ def load_bnn_artifacts(
         token = action_tokens[index]
         action_encoder.lookup[token] = index
         action_encoder.reverse[index] = token
+
+    expected_action_sig = metadata.get("action_encoder_signature")
+    computed_action_sig = action_encoder_signature(action_encoder)
+    if expected_action_sig:
+        if computed_action_sig != expected_action_sig:
+            raise RuntimeError("Action encoder signature mismatch between runtime and artifact metadata.")
+    else:
+        logger.warning("Artifact metadata missing action_encoder_signature; skipping compatibility check.")
 
     model = StateBayesianNN(feature_size, num_actions, device=device).to(device)
     guide = StateBNNGuide(model, device=device).to(device)

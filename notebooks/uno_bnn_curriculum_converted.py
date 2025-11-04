@@ -36,6 +36,7 @@ import csv
 import dataclasses
 import enum
 import functools
+import hashlib
 import itertools
 import json
 import logging
@@ -96,21 +97,9 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     tqdm = None
 
-RNG = random.Random(13)
-torch.manual_seed(13)
-np.random.seed(13)
-
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(13)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    try:
-        torch.set_float32_matmul_precision("medium")  # type: ignore[attr-defined]
-    except AttributeError:  # pragma: no cover - older torch
-        pass
-
 DEFAULT_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEFAULT_NUM_WORKERS = max(1, min(4, (os.cpu_count() or 1)))
+ARTIFACT_SCHEMA_VERSION = "1.0.0"
 
 # %% [code cell 2]
 class ScenarioType(enum.Enum):
@@ -121,9 +110,18 @@ class ScenarioType(enum.Enum):
     WILD_DILEMMA = "WILD_DILEMMA"
 
 
-PLAYER_SEQUENCE = ("P0", "P1", "P2", "P3")
-TEAM_MAP = {"P0": 0, "P2": 0, "P1": 1, "P3": 1}
-TEAM_SCORES = {0: 0, 1: 0}
+DEFAULT_PLAYER_ORDER: Tuple[str, ...] = ("P0", "P1", "P2", "P3")
+
+
+def _default_team_map(order: Sequence[str]) -> Dict[str, int]:
+    return {pid: idx % 2 for idx, pid in enumerate(order)}
+
+
+DEFAULT_TEAM_MAP: Dict[str, int] = _default_team_map(DEFAULT_PLAYER_ORDER)
+
+
+def _default_team_scores(team_map: Dict[str, int]) -> Dict[int, int]:
+    return {team_index: 0 for team_index in sorted(set(team_map.values()))}
 STANDARD_COLORS = [Color.RED, Color.YELLOW, Color.GREEN, Color.BLUE]
 COLOR_VALUE_TO_ENUM = {color.value: color for color in STANDARD_COLORS}
 
@@ -138,6 +136,8 @@ class ScenarioParameters:
     hand_diversity: int = 3
     color_bias: Optional[Color] = None
     randomize: bool = True
+    player_order: Optional[Tuple[str, ...]] = None
+    team_map: Optional[Dict[str, int]] = None
 
 
 @dataclass
@@ -152,8 +152,19 @@ class ScenarioExample:
 class ScenarioForge:
     """Procedurally generate goal-directed UNO states for downstream training."""
 
-    def __init__(self, *, rng: Optional[random.Random] = None) -> None:
+    def __init__(
+        self,
+        *,
+        rng: Optional[random.Random] = None,
+        player_order: Optional[Sequence[str]] = None,
+        team_map: Optional[Dict[str, int]] = None,
+    ) -> None:
         self.rng = rng or random.Random()
+        resolved_order = tuple(player_order) if player_order else DEFAULT_PLAYER_ORDER
+        resolved_team_map = dict(team_map) if team_map else _default_team_map(resolved_order)
+        self._validate_team_context(resolved_order, resolved_team_map)
+        self.player_order = resolved_order
+        self.team_map = resolved_team_map
 
     # ------------------------------------------------------------------
     # Public API
@@ -192,6 +203,22 @@ class ScenarioForge:
             examples.append(self.generate(params))
         return examples
 
+    def _validate_team_context(self, order: Sequence[str], team_map: Dict[str, int]) -> None:
+        missing = [pid for pid in order if pid not in team_map]
+        if missing:
+            raise ValueError(f"Team map missing assignments for players: {missing}")
+        if len(order) != len(set(order)):
+            raise ValueError("Player order contains duplicate player IDs.")
+
+    def _resolve_player_context(self, params: ScenarioParameters) -> Tuple[Tuple[str, ...], Dict[str, int]]:
+        order = tuple(params.player_order) if params.player_order else self.player_order
+        team_map = dict(params.team_map) if params.team_map else dict(self.team_map)
+        self._validate_team_context(order, team_map)
+        return order, team_map
+
+    def _team_scores_for(self, team_map: Dict[str, int]) -> Dict[int, int]:
+        return _default_team_scores(team_map)
+
     # ------------------------------------------------------------------
     # Scenario builders
     # ------------------------------------------------------------------
@@ -201,22 +228,26 @@ class ScenarioForge:
         top_number = self.rng.randint(0, 9)
         top_card = self._make_number_card(top_color, top_number)
 
+        player_order, team_map = self._resolve_player_context(params)
+
         target_hand = self._make_random_hand(params.mode, hand_size=distance)
         playable_card = self._ensure_playable(target_hand, top_card, top_color)
 
         other_hands = {
             pid: self._make_random_hand(params.mode, hand_size=self.rng.randint(4, 7))
-            for pid in PLAYER_SEQUENCE
+            for pid in player_order
             if pid != params.target_player
         }
 
-        current_player_idx = PLAYER_SEQUENCE.index(params.target_player)
+        current_player_idx = player_order.index(params.target_player)
         state = self._assemble_state(
             mode=params.mode,
             hands={params.target_player: target_hand, **other_hands},
             discard=[top_card],
             current_player_index=current_player_idx,
             current_color=top_color,
+            player_order=player_order,
+            team_map=team_map,
         )
 
         metadata = {
@@ -234,12 +265,14 @@ class ScenarioForge:
             else self._make_wild_draw_four()
         )
 
+        player_order, team_map = self._resolve_player_context(params)
+
         target_hand = self._make_random_hand(params.mode, hand_size=self.rng.randint(3, 6))
         response_card = self._ensure_stack_response(target_hand, stack_card_type)
 
         other_hands = {
             pid: self._make_random_hand(params.mode, hand_size=self.rng.randint(4, 7))
-            for pid in PLAYER_SEQUENCE
+            for pid in player_order
             if pid != params.target_player
         }
 
@@ -258,10 +291,12 @@ class ScenarioForge:
             mode=params.mode,
             hands={params.target_player: target_hand, **other_hands},
             discard=[top_card],
-            current_player_index=PLAYER_SEQUENCE.index(params.target_player),
+            current_player_index=player_order.index(params.target_player),
             current_color=top_card.color if top_card.color != Color.WILD else None,
             pending_action=pending,
             draw_stack_total=stack_size,
+            player_order=player_order,
+            team_map=team_map,
         )
 
         metadata = {
@@ -273,7 +308,8 @@ class ScenarioForge:
     def _setup(self, params: ScenarioParameters) -> ScenarioExample:
         diversity = max(2, min(4, params.hand_diversity))
         preferred_colors = self.rng.sample(STANDARD_COLORS, diversity)
-        teammate = self._teammate_of(params.target_player)
+        player_order, team_map = self._resolve_player_context(params)
+        teammate = self._teammate_of(params.target_player, team_map)
         teammate_color = preferred_colors[0]
 
         top_color = params.color_bias or preferred_colors[-1]
@@ -288,7 +324,7 @@ class ScenarioForge:
         teammate_hand = [self._make_number_card(teammate_color, self.rng.randint(1, 9)) for _ in range(5)]
         opponent_hands = {
             pid: self._make_random_hand(params.mode, hand_size=self.rng.randint(5, 8))
-            for pid in PLAYER_SEQUENCE
+            for pid in player_order
             if pid not in {params.target_player, teammate}
         }
 
@@ -300,8 +336,10 @@ class ScenarioForge:
                 **opponent_hands,
             },
             discard=[top_card],
-            current_player_index=PLAYER_SEQUENCE.index(params.target_player),
+            current_player_index=player_order.index(params.target_player),
             current_color=top_color,
+            player_order=player_order,
+            team_map=team_map,
         )
 
         metadata = {
@@ -315,13 +353,15 @@ class ScenarioForge:
         strong_color = self.rng.choice([c for c in STANDARD_COLORS if c != weak_color])
         top_card = self._make_number_card(strong_color, self.rng.randint(0, 9))
 
+        player_order, team_map = self._resolve_player_context(params)
+
         target_hand = self._make_random_hand(params.mode, hand_size=self.rng.randint(5, 7))
         target_hand.append(self._make_action_card(strong_color, CardType.SKIP))
 
-        teammate = self._teammate_of(params.target_player)
+        teammate = self._teammate_of(params.target_player, team_map)
         teammate_hand = self._make_random_hand(params.mode, hand_size=self.rng.randint(4, 6))
 
-        opponents = [pid for pid in PLAYER_SEQUENCE if pid not in {params.target_player, teammate}]
+        opponents = [pid for pid in player_order if pid not in {params.target_player, teammate}]
         opponent_hands = {
             opponents[0]: self._make_hand_without_color(params.mode, color=weak_color, hand_size=self.rng.randint(5, 7)),
             opponents[1]: self._make_random_hand(params.mode, hand_size=self.rng.randint(5, 7)),
@@ -335,8 +375,10 @@ class ScenarioForge:
                 **opponent_hands,
             },
             discard=[top_card],
-            current_player_index=PLAYER_SEQUENCE.index(params.target_player),
+            current_player_index=player_order.index(params.target_player),
             current_color=top_card.color,
+            player_order=player_order,
+            team_map=team_map,
         )
 
         metadata = {
@@ -350,6 +392,8 @@ class ScenarioForge:
         alt_color = self.rng.choice([c for c in STANDARD_COLORS if c != base_color])
         top_card = self._make_number_card(base_color, self.rng.randint(1, 9))
 
+        player_order, team_map = self._resolve_player_context(params)
+
         target_hand = [
             self._make_number_card(base_color, top_card.number),
             self._make_number_card(alt_color, self.rng.randint(0, 9)),
@@ -359,7 +403,7 @@ class ScenarioForge:
         ]
         other_hands = {
             pid: self._make_random_hand(params.mode, hand_size=self.rng.randint(4, 7))
-            for pid in PLAYER_SEQUENCE
+            for pid in player_order
             if pid != params.target_player
         }
 
@@ -367,8 +411,10 @@ class ScenarioForge:
             mode=params.mode,
             hands={params.target_player: target_hand, **other_hands},
             discard=[top_card],
-            current_player_index=PLAYER_SEQUENCE.index(params.target_player),
+            current_player_index=player_order.index(params.target_player),
             current_color=top_card.color,
+            player_order=player_order,
+            team_map=team_map,
         )
 
         metadata = {
@@ -405,10 +451,19 @@ class ScenarioForge:
 
     def _make_hand_without_color(self, mode: GameMode, color: Color, hand_size: int) -> List[Card]:
         hand = []
-        while len(hand) < hand_size:
+        attempts = 0
+        max_attempts = max(hand_size * 12, 24)
+        while len(hand) < hand_size and attempts < max_attempts:
+            attempts += 1
             card = self._make_random_hand(mode, 1)[0]
             if card.color != color:
                 hand.append(card)
+        if len(hand) < hand_size:
+            logger.warning(
+                "ScenarioForge: unable to fully satisfy color exclusion after %d attempts; backfilling remaining cards.",
+                attempts,
+            )
+            hand.extend(self._make_random_hand(mode, hand_size - len(hand)))
         return hand
 
     def _assemble_state(
@@ -419,12 +474,20 @@ class ScenarioForge:
         discard: List[Card],
         current_player_index: int,
         current_color: Optional[Color],
+        player_order: Sequence[str],
+        team_map: Dict[str, int],
         pending_action: Optional[PendingAction] = None,
         draw_stack_total: int = 0,
+        team_scores: Optional[Dict[int, int]] = None,
     ) -> GameState:
+        self._validate_team_context(player_order, team_map)
+        for pid in player_order:
+            if pid not in hands:
+                raise ValueError(f"Missing hand for player '{pid}' while assembling state.")
+
         players = [
             Player(player_id=pid, hand=list(hands[pid]), score=0)
-            for pid in PLAYER_SEQUENCE
+            for pid in player_order
         ]
 
         deck = build_deck_for_mode(mode)
@@ -433,6 +496,8 @@ class ScenarioForge:
         for card in discard:
             self._try_remove_card(deck, card)
         shuffle_in_place(deck, self.rng)
+
+        resolved_team_scores = team_scores or self._team_scores_for(team_map)
 
         state = GameState(
             players=players,
@@ -443,8 +508,8 @@ class ScenarioForge:
             current_color=current_color,
             pending_action=pending_action,
             mode=mode,
-            team_map=dict(TEAM_MAP),
-            team_scores=dict(TEAM_SCORES),
+            team_map=dict(team_map),
+            team_scores=dict(resolved_team_scores),
             draw_stack_total=draw_stack_total,
         )
         return state
@@ -505,9 +570,9 @@ class ScenarioForge:
     def _make_wild_draw_four(self) -> Card:
         return Card(color=Color.WILD, type=CardType.WILD_DRAW_FOUR, value=50)
 
-    def _teammate_of(self, player_id: str) -> str:
-        team_index = TEAM_MAP[player_id]
-        for pid, t_index in TEAM_MAP.items():
+    def _teammate_of(self, player_id: str, team_map: Dict[str, int]) -> str:
+        team_index = team_map[player_id]
+        for pid, t_index in team_map.items():
             if pid != player_id and t_index == team_index:
                 return pid
         raise ValueError(f"No teammate registered for player '{player_id}'")
@@ -554,7 +619,9 @@ class BotPolicy(abc.ABC):
         if pass_allowed:
             actions.append(BotAction(ActionType.PASS))
 
-        if draw_allowed:
+        has_play_action = any(action.action_type == ActionType.PLAY for action in actions)
+
+        if draw_allowed and not has_play_action:
             actions.append(BotAction(ActionType.DRAW))
         elif not actions:
             # Fallback safeguard - drawing keeps the loop progressing even if heuristics disagree.
@@ -847,23 +914,6 @@ class ScenarioLabeler:
         except InvalidMoveError:
             return state, False
 
-# %% [code cell 5]
-# Quick sanity check: generate one sample per archetype and preview bot actions.
-forge = ScenarioForge(rng=random.Random(21))
-labeler = ScenarioLabeler(rng=random.Random(22))
-bots = [OracleBot(rng=random.Random(23)), AggressorBot(rng=random.Random(24))]
-
-samples: Dict[str, Dict[str, Any]] = {}
-for scenario_type in ScenarioType:
-    scenario = forge.generate(ScenarioParameters(scenario_type=scenario_type))
-    labeled = labeler.label([scenario], bots)
-    samples[scenario_type.value] = {
-        "target_player": scenario.target_player,
-        "top_discard": scenario.state.discard_pile[-1].type.name,
-        "bot_actions": {entry.bot_name: entry.action.info for entry in labeled},
-    }
-samples
-# %% [code cell 6]
 CARD_TYPES_FOR_ENCODING = [
     CardType.NUMBER,
     CardType.SKIP,
@@ -888,7 +938,8 @@ MODE_ORDER = [GameMode.CLASSIC_2V2, GameMode.GO_WILD_2V2]
 
 
 class StateEncoder:
-    def __init__(self) -> None:
+    def __init__(self, player_order: Optional[Sequence[str]] = None) -> None:
+        self.player_order: Optional[Tuple[str, ...]] = tuple(player_order) if player_order else None
         self.feature_size = self._compute_feature_size()
 
     def encode(self, labeled: LabeledScenario) -> np.ndarray:
@@ -910,10 +961,11 @@ class StateEncoder:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
         metadata = metadata or {}
+        player_order = self._resolve_player_order(state)
         features: List[float] = []
 
         # Player-centric features (ordered P0..P3)
-        for pid in PLAYER_SEQUENCE:
+        for pid in player_order:
             player = next((player for player in state.players if player.player_id == pid), None)
             hand = list(player.hand) if player is not None else []
             features.append(len(hand) / 20.0)
@@ -959,7 +1011,7 @@ class StateEncoder:
         features.extend(self._encode_color(metadata.get("weak_opponent_color")))
 
         # Target player & persona identity
-        target_one_hot = [1.0 if pid == target_player else 0.0 for pid in PLAYER_SEQUENCE]
+        target_one_hot = [1.0 if pid == target_player else 0.0 for pid in player_order]
         features.extend(target_one_hot)
         bot_one_hot = [1.0 if bot_name == name else 0.0 for name in BOT_ORDER]
         features.extend(bot_one_hot)
@@ -970,7 +1022,8 @@ class StateEncoder:
         return np.array(features, dtype=np.float32)
 
     def _compute_feature_size(self) -> int:
-        dummy_state = ScenarioForge(rng=random.Random(0)).generate(
+        forge = ScenarioForge(rng=random.Random(0), player_order=self.player_order)
+        dummy_state = forge.generate(
             ScenarioParameters(scenario_type=ScenarioType.FINISHER)
         )
         dummy_labeled = LabeledScenario(
@@ -981,6 +1034,11 @@ class StateEncoder:
             action_success=True,
         )
         return len(self.encode(dummy_labeled))
+
+    def _resolve_player_order(self, state: GameState) -> Tuple[str, ...]:
+        if self.player_order is not None:
+            return self.player_order
+        return tuple(player.player_id for player in state.players)
 
     def _encode_color(self, color: Optional[Color]) -> List[float]:
         if isinstance(color, str):
@@ -1029,7 +1087,12 @@ class ActionEncoder:
 
     def encode(self, labeled: LabeledScenario) -> int:
         token = self._to_token(labeled.action)
-        return self.lookup.get(token, self.lookup["DRAW"])
+        if token not in self.lookup:
+            raise ValueError(
+                "Unknown action token encountered during encoding. "
+                f"Token='{token}' | action={labeled.action} | bot={labeled.bot_name}"
+            )
+        return self.lookup[token]
 
     def decode(self, index: int) -> str:
         return self.reverse[index]
@@ -1040,38 +1103,59 @@ class ActionEncoder:
             return BotAction(ActionType.DRAW)
         if token == "PASS":
             return BotAction(ActionType.PASS)
+        if token not in self.lookup:
+            raise ValueError(f"Unknown action token '{token}' cannot be decoded.")
+
         hand = next(player.hand for player in state.players if player.player_id == player_id)
         parts = token.split("_")
-        if len(parts) < 3:
-            return BotAction(ActionType.DRAW)
-        if parts[1] == "NUMBER" and len(parts) == 4:
-            color = Color[parts[2]]
-            number = int(parts[3])
-            card = self._find_card(hand, lambda c: c.type == CardType.NUMBER and c.color == color and c.number == number)
-            if card:
-                return BotAction(ActionType.PLAY, card=card)
-        elif parts[1] in {"SKIP", "REVERSE", "DRAW", "DISCARD"}:
-            card_type = CardType["_".join(parts[1:len(parts)-1]) if parts[1] == "DRAW" and parts[2] == "TWO" else parts[1]]
-            if card_type == CardType.DRAW_TWO:
-                color = Color[parts[3]]
-            elif card_type == CardType.DISCARD_ALL:
-                color = Color[parts[3]]
-            else:
+
+        if len(parts) < 2 or parts[0] != "PLAY":
+            raise ValueError(f"Malformed action token '{token}'.")
+
+        def require_card(predicate: Callable[[Card], bool]) -> Card:
+            card = self._find_card(hand, predicate)
+            if not card:
+                raise ValueError(f"Token '{token}' cannot be resolved: card absent from player hand.")
+            return card
+
+        try:
+            if parts[1] == "NUMBER" and len(parts) == 4:
                 color = Color[parts[2]]
-            card = self._find_card(hand, lambda c: c.type == card_type and c.color == color)
-            if card:
+                number = int(parts[3])
+                card = require_card(
+                    lambda c: c.type == CardType.NUMBER and c.color == color and c.number == number
+                )
                 return BotAction(ActionType.PLAY, card=card)
-        elif parts[1] == "WILD" and len(parts) == 3:
-            chosen_color = Color[parts[2]]
-            card = self._find_card(hand, lambda c: c.type == CardType.WILD)
-            if card:
+
+            if parts[1] == "DRAW" and len(parts) == 4 and parts[2] == "TWO":
+                color = Color[parts[3]]
+                card = require_card(lambda c: c.type == CardType.DRAW_TWO and c.color == color)
+                return BotAction(ActionType.PLAY, card=card)
+
+            if parts[1] == "DISCARD" and len(parts) == 4 and parts[2] == "ALL":
+                color = Color[parts[3]]
+                card = require_card(lambda c: c.type == CardType.DISCARD_ALL and c.color == color)
+                return BotAction(ActionType.PLAY, card=card)
+
+            if parts[1] in {"SKIP", "REVERSE"} and len(parts) == 3:
+                color = Color[parts[2]]
+                card_type = CardType[parts[1]]
+                card = require_card(lambda c: c.type == card_type and c.color == color)
+                return BotAction(ActionType.PLAY, card=card)
+
+            if parts[1] == "WILD" and len(parts) == 3:
+                chosen_color = Color[parts[2]]
+                card = require_card(lambda c: c.type == CardType.WILD)
                 return BotAction(ActionType.PLAY, card=card, chosen_color=chosen_color)
-        elif parts[1] == "WILD" and parts[2] == "DRAW" and len(parts) == 5:
-            chosen_color = Color[parts[4]]
-            card = self._find_card(hand, lambda c: c.type == CardType.WILD_DRAW_FOUR)
-            if card:
+
+            if parts[1] == "WILD" and len(parts) == 5 and parts[2] == "DRAW" and parts[3] == "FOUR":
+                chosen_color = Color[parts[4]]
+                card = require_card(lambda c: c.type == CardType.WILD_DRAW_FOUR)
                 return BotAction(ActionType.PLAY, card=card, chosen_color=chosen_color)
-        return BotAction(ActionType.DRAW)
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"Failed to decode action token '{token}': {exc}") from exc
+
+        raise ValueError(f"Unrecognized action token format '{token}'.")
 
     def _find_card(self, hand: Sequence[Card], predicate: Callable[[Card], bool]) -> Optional[Card]:
         for card in hand:
@@ -1111,12 +1195,44 @@ class ActionEncoder:
             yield f"PLAY_WILD_{color.value}"
             yield f"PLAY_WILD_DRAW_FOUR_{color.value}"
 
+def _stable_hash(payload: Any) -> str:
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def state_encoder_signature(state_encoder: StateEncoder, team_map: Optional[Dict[str, int]] = None) -> str:
+    payload: Dict[str, Any] = {
+        "feature_size": state_encoder.feature_size,
+        "player_order": list(state_encoder.player_order) if state_encoder.player_order else None,
+        "standard_colors": [color.value for color in STANDARD_COLORS],
+        "special_types": [stype.name for stype in SPECIAL_TYPES],
+        "pending_types": [ptype.name for ptype in PENDING_TYPES],
+    }
+    if team_map:
+        payload["team_map"] = dict(team_map)
+    return _stable_hash(payload)
+
+
+def action_encoder_signature(action_encoder: ActionEncoder) -> str:
+    payload = {
+        "token_to_index": sorted(action_encoder.lookup.items(), key=lambda item: item[0]),
+    }
+    return _stable_hash(payload)
+
 # %% [code cell 7]
 class ScenarioDataset(Dataset):
-    def __init__(self, features: np.ndarray, labels: np.ndarray, metadata: List[Dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        features: np.ndarray,
+        labels: np.ndarray,
+        metadata: List[Dict[str, Any]],
+        *,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.features = torch.from_numpy(features).float()
         self.labels = torch.from_numpy(labels).long()
         self.metadata = metadata
+        self.context: Dict[str, Any] = dict(context or {})
 
     def __len__(self) -> int:  # pragma: no cover - trivial
         return len(self.features)
@@ -1175,13 +1291,20 @@ class StateBayesianNN(PyroModule):
         dropout_temperature: float = 0.08,
         dropout_min: float = 0.05,
         dropout_max: float = 0.35,
-        confidence_lambda: float = 0.075,
+        confidence_lambda: float = 0.15,
+        class_weights: Optional[torch.Tensor] = None,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
         device = device or torch.device("cpu")
         self.kl_scale = 1.0
         self.confidence_lambda = float(max(confidence_lambda, 0.0))
+        if class_weights is not None:
+            weight_tensor = class_weights.clone().detach().to(device)
+        else:
+            weight_tensor = torch.ones(num_classes, device=device)
+        self.register_buffer("class_weights", weight_tensor)
+        self.use_class_weights = class_weights is not None
         self.backbone = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -1240,6 +1363,11 @@ class StateBayesianNN(PyroModule):
             pyro.factor("confidence_regularizer", penalty)
         with pyro.plate("data", x.size(0)):
             pyro.sample("obs", dist.Categorical(logits=log_probs), obs=y)
+            if self.use_class_weights and y is not None:
+                weights = self.class_weights.index_select(0, y)
+                log_p = log_probs.gather(1, y.unsqueeze(-1)).squeeze(-1)
+                adjustment = (weights - 1.0) * log_p
+                pyro.factor("class_weight_adjustment", adjustment.sum())
         return log_probs
 
     def set_kl_scale(self, scale: float) -> None:
@@ -1304,7 +1432,7 @@ class TrainingConfig:
     kl_beta_end: float = 1.0
     kl_warmup_epochs: int = 10
     dropout_init: float = 0.12
-    confidence_lambda: float = 0.075
+    confidence_lambda: float = 0.15
     dropout_temperature: float = 0.08
     dropout_min: float = 0.05
     dropout_max: float = 0.35
@@ -1363,6 +1491,34 @@ def train_bnn(
     input_dim = dataset.features.shape[1]
     num_classes = len(action_encoder.lookup)
 
+    labels_np = dataset.labels.numpy()
+    class_counts = np.bincount(labels_np, minlength=num_classes)
+    safe_counts = np.where(class_counts == 0, 1, class_counts)
+    raw_weights = len(labels_np) / (num_classes * safe_counts)
+    normalized_weights = raw_weights / np.maximum(raw_weights.mean(), 1e-8)
+    class_weights_tensor = torch.from_numpy(normalized_weights.astype(np.float32))
+
+    nonzero_classes = int((class_counts > 0).sum())
+    min_count = int(class_counts[class_counts > 0].min()) if nonzero_classes else 0
+    max_count = int(class_counts.max()) if nonzero_classes else 0
+    draw_index = action_encoder.lookup.get("DRAW")
+    draw_count = int(class_counts[draw_index]) if draw_index is not None else 0
+    logger.info(
+        "Class distribution | total=%d | observed_classes=%d/%d | min=%d | max=%d",
+        len(labels_np),
+        nonzero_classes,
+        num_classes,
+        min_count,
+        max_count,
+    )
+    if nonzero_classes < num_classes:
+        logger.warning(
+            "Detected %d action classes with zero samples; model will rely on priors for these actions.",
+            num_classes - nonzero_classes,
+        )
+    if draw_index is not None and len(labels_np) > 0:
+        logger.info("  DRAW frequency: %d (%.2f%%)", draw_count, (draw_count / len(labels_np)) * 100.0)
+
     model = StateBayesianNN(
         input_dim,
         num_classes,
@@ -1371,6 +1527,7 @@ def train_bnn(
         dropout_min=config.dropout_min,
         dropout_max=config.dropout_max,
         confidence_lambda=config.confidence_lambda,
+        class_weights=class_weights_tensor.to(device),
         device=device,
     ).to(device)
     guide = StateBNNGuide(model, device=device).to(device)
@@ -1531,6 +1688,10 @@ def train_bnn(
     model.set_kl_scale(1.0)
     guide.set_kl_scale(1.0)
 
+    dataset_context = getattr(dataset, "context", {}) if hasattr(dataset, "context") else {}
+    player_order_ctx = dataset_context.get("player_order")
+    team_map_ctx = dataset_context.get("team_map")
+
     metadata = {
         "run_id": run_label,
         "device": str(device),
@@ -1538,6 +1699,24 @@ def train_bnn(
         "val_samples": val_size,
         "batch_size": config.batch_size,
         "learning_rate": config.learning_rate,
+    }
+
+    if player_order_ctx is None and state_encoder.player_order is not None:
+        player_order_ctx = list(state_encoder.player_order)
+    if player_order_ctx is not None:
+        metadata["player_order"] = list(player_order_ctx)
+
+    if team_map_ctx is not None:
+        metadata["team_map"] = dict(team_map_ctx)
+
+    metadata["schema_version"] = ARTIFACT_SCHEMA_VERSION
+    metadata["state_encoder_signature"] = state_encoder_signature(state_encoder, team_map_ctx)
+    metadata["action_encoder_signature"] = action_encoder_signature(action_encoder)
+
+    metadata["class_distribution"] = {
+        "counts": class_counts.tolist(),
+        "weights": normalized_weights.tolist(),
+        "draw_index": draw_index,
     }
 
     metadata["kl_schedule"] = {
@@ -1648,6 +1827,7 @@ def _generate_stratified_scenarios(
     mode: GameMode,
     num_scenarios: int,
     rng: random.Random,
+    max_attempts: int = 128,
 ) -> List[ScenarioExample]:
     if num_scenarios <= 0:
         return []
@@ -1667,10 +1847,23 @@ def _generate_stratified_scenarios(
     scenarios: List[ScenarioExample] = []
     for name in bucket_order:
         scenario_types = groups[name]
-        for _ in range(counts[name]):
+        target_count = counts[name]
+        generated = 0
+        attempt_limit = max(target_count * 5, max_attempts)
+        attempts = 0
+        while generated < target_count and attempts < attempt_limit:
+            attempts += 1
             scenario_type = rng.choice(scenario_types)
             params = ScenarioParameters(scenario_type=scenario_type, mode=mode)
             scenarios.append(forge.generate(params))
+            generated += 1
+        if generated < target_count:
+            logger.warning(
+                "Stratified scenario generation exhausted attempts for bucket '%s' (%d/%d produced).",
+                name,
+                generated,
+                target_count,
+            )
     rng.shuffle(scenarios)
     return scenarios
 
@@ -1869,13 +2062,48 @@ def _augment_with_pseudo_replay(
     return augmented
 
 
+def _downsample_random_bot_labels(
+    labeled: Sequence[LabeledScenario],
+    *,
+    target_fraction: float,
+    rng: random.Random,
+    persona_name: str = "RandomBot",
+) -> List[LabeledScenario]:
+    if not labeled:
+        return []
+    if target_fraction <= 0.0:
+        return [entry for entry in labeled if entry.bot_name != persona_name]
+
+    others: List[LabeledScenario] = []
+    random_entries: List[LabeledScenario] = []
+    for entry in labeled:
+        if entry.bot_name == persona_name:
+            random_entries.append(entry)
+        else:
+            others.append(entry)
+
+    if not random_entries:
+        return list(labeled)
+
+    # Determine desired count such that random / total ≈ target_fraction.
+    desired_random = int(round((target_fraction * len(others)) / max(1e-9, 1.0 - target_fraction)))
+    desired_random = max(0, min(desired_random, len(random_entries)))
+
+    if desired_random == len(random_entries):
+        return others + random_entries
+
+    sampled_random = rng.sample(random_entries, desired_random) if desired_random > 0 else []
+    return others + sampled_random
+
+
 def build_synthetic_dataset(
     *,
     mode: GameMode,
     num_scenarios: int,
     scenario_mix: Optional[Dict[ScenarioType, float]] = None,
     rng_seed: int = 1024,
-    include_random_bot: bool = True,
+    include_random_bot: bool = False,
+    random_bot_fraction: float = 0.05,
 ) -> Tuple[ScenarioDataset, List[LabeledScenario], StateEncoder, ActionEncoder]:
     rng = random.Random(rng_seed)
     forge = ScenarioForge(rng=rng)
@@ -1903,11 +2131,20 @@ def build_synthetic_dataset(
         SupporterBot(rng=random.Random(rng_seed + 3)),
         ConservativeBot(rng=random.Random(rng_seed + 4)),
     ]
+    random_bot: Optional[RandomBot] = None
     if include_random_bot:
-        bots.append(RandomBot(rng=random.Random(rng_seed + 5)))
+        random_bot = RandomBot(rng=random.Random(rng_seed + 5))
+        bots.append(random_bot)
 
     labeler = ScenarioLabeler(rng=random.Random(rng_seed + 6))
     base_labeled = labeler.label(scenarios, bots)
+    if random_bot is not None and 0.0 <= random_bot_fraction < 1.0:
+        base_labeled = _downsample_random_bot_labels(
+            base_labeled,
+            target_fraction=random_bot_fraction,
+            rng=rng,
+            persona_name=random_bot.name,
+        )
     augmented: List[LabeledScenario] = list(base_labeled)
     color_augmented = _augment_labeled_by_color_symmetry(base_labeled, _cyclic_color_mappings())
     augmented.extend(color_augmented)
@@ -1922,7 +2159,7 @@ def build_synthetic_dataset(
     augmented.extend(pseudo_replay)
     labeled = augmented
 
-    state_encoder = StateEncoder()
+    state_encoder = StateEncoder(player_order=forge.player_order)
     action_encoder = ActionEncoder()
 
     feature_rows: List[np.ndarray] = []
@@ -1944,7 +2181,11 @@ def build_synthetic_dataset(
 
     features = np.stack(feature_rows)
     labels = np.array(label_rows, dtype=np.int64)
-    dataset = ScenarioDataset(features, labels, metadata)
+    dataset_context = {
+        "player_order": list(forge.player_order),
+        "team_map": dict(forge.team_map),
+    }
+    dataset = ScenarioDataset(features, labels, metadata, context=dataset_context)
     return dataset, labeled, state_encoder, action_encoder
 
 # %% [code cell 12]
@@ -1961,13 +2202,16 @@ def export_artifacts(
 
     pyro.get_param_store().save(str(param_store_path))
 
-    meta = {
-        "model_tag": model_tag,
-        "feature_size": artifacts.state_encoder.feature_size,
-        "num_actions": len(artifacts.action_encoder.lookup),
-        "action_tokens": artifacts.action_encoder.reverse,
-        "history": artifacts.history,
-    }
+    meta = dict(artifacts.metadata)
+    meta.update(
+        {
+            "model_tag": model_tag,
+            "feature_size": artifacts.state_encoder.feature_size,
+            "num_actions": len(artifacts.action_encoder.lookup),
+            "action_tokens": artifacts.action_encoder.reverse,
+            "history": artifacts.history,
+        }
+    )
     if extra_metadata:
         meta.update(extra_metadata)
 
@@ -2128,28 +2372,32 @@ def _generate_forced_draw_scenarios(
                 continue
             target_hand.append(forge._make_number_card(color, number))
 
+        player_order = forge.player_order
+        target_player = player_order[0]
         hands = {
             pid: forge._make_random_hand(mode, hand_size=rng.randint(4, 7))
-            for pid in PLAYER_SEQUENCE
+            for pid in player_order
         }
-        hands["P0"] = target_hand
+        hands[target_player] = target_hand
 
         state = forge._assemble_state(
             mode=mode,
             hands=hands,
             discard=[top_card],
-            current_player_index=0,
+            current_player_index=player_order.index(target_player),
             current_color=top_color,
+            player_order=player_order,
+            team_map=forge.team_map,
         )
 
-        if engine.get_valid_moves(state, "P0"):
+        if engine.get_valid_moves(state, target_player):
             continue
 
         params = ScenarioParameters(scenario_type=ScenarioType.SETUP, mode=mode)
         scenarios.append(
             ScenarioExample(
                 state=state,
-                target_player="P0",
+                target_player=target_player,
                 scenario_type=ScenarioType.SETUP,
                 parameters=params,
                 metadata={"forced_draw": True},
@@ -2206,7 +2454,14 @@ def run_pragmatic_checks(
     overconfidence_samples: int = 40,
 ) -> Dict[str, Any]:
     rng = random.Random(rng_seed)
-    forge = ScenarioForge(rng=random.Random(rng_seed + 1))
+    player_order_meta = artifacts.metadata.get("player_order")
+    team_map_meta = artifacts.metadata.get("team_map")
+    forge_kwargs: Dict[str, Any] = {"rng": random.Random(rng_seed + 1)}
+    if player_order_meta:
+        forge_kwargs["player_order"] = tuple(player_order_meta)
+    if team_map_meta:
+        forge_kwargs["team_map"] = dict(team_map_meta)
+    forge = ScenarioForge(**forge_kwargs)
     engine = UnoEngine()
     bnn_bot = BNNBot(
         artifacts,
@@ -2478,7 +2733,11 @@ class BNNBot(BotPolicy):
 
         if not candidates:
             token = evaluation["prediction_token"]
-            fallback = self.artifacts.action_encoder.token_to_action(token, state, player_id)
+            try:
+                fallback = self.artifacts.action_encoder.token_to_action(token, state, player_id)
+            except ValueError as exc:
+                logger.error("Failed to decode BNN token '%s' for player %s: %s", token, player_id, exc)
+                fallback = BotAction(ActionType.DRAW)
             fallback.info.update(
                 {
                     "bnn_entropy": entropy,
@@ -2990,6 +3249,7 @@ def build_dataset_from_labeled(
     *,
     state_encoder: StateEncoder,
     action_encoder: ActionEncoder,
+    context: Optional[Dict[str, Any]] = None,
 ) -> ScenarioDataset:
     feature_rows: List[np.ndarray] = []
     label_rows: List[int] = []
@@ -3010,7 +3270,7 @@ def build_dataset_from_labeled(
 
     features = np.stack(feature_rows)
     labels = np.array(label_rows, dtype=np.int64)
-    return ScenarioDataset(features, labels, metadata)
+    return ScenarioDataset(features, labels, metadata, context=context)
 
 # %% [code cell 17]
 def run_curriculum_loop(
@@ -3102,6 +3362,7 @@ def run_curriculum_loop(
             labeled,
             state_encoder=state_encoder,
             action_encoder=action_encoder,
+            context=dataset.context,
         )
 
         pyro.clear_param_store()
@@ -3184,17 +3445,70 @@ def configure_root_logger(level: str = "INFO", log_file: Optional[Path] = None) 
         root_logger.addHandler(file_handler)
 
 
+def configure_seeds(
+    seed: Optional[int],
+    *,
+    deterministic: bool = False,
+    enable_tf32: bool = False,
+) -> None:
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        pyro.set_rng_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    cuda_available = torch.cuda.is_available()
+    allow_tf32 = enable_tf32 and not deterministic
+
+    if cuda_available:
+        torch.backends.cudnn.benchmark = not deterministic
+        torch.backends.cudnn.deterministic = deterministic
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+            except AttributeError:  # pragma: no cover - backend differences
+                pass
+
+    if hasattr(torch, "set_float32_matmul_precision"):
+        precision = "high" if deterministic or not allow_tf32 else "medium"
+        try:
+            torch.set_float32_matmul_precision(precision)  # type: ignore[attr-defined]
+        except (RuntimeError, AttributeError):  # pragma: no cover - backend differences
+            pass
+
+
 def resolve_device(preference: str) -> torch.device:
-    preference = preference.lower()
-    if preference == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if preference == "cpu":
+    preference = preference.strip()
+    if not preference:
         return torch.device("cpu")
-    if preference == "cuda":
+
+    normalized = preference.lower()
+    if normalized == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    try:
+        device = torch.device(preference)
+    except (TypeError, RuntimeError) as exc:
+        raise ValueError(f"Unknown device preference '{preference}'.") from exc
+
+    if device.type == "cuda":
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested but is not available on this system.")
-        return torch.device("cuda")
-    raise ValueError(f"Unknown device preference '{preference}'. Use 'auto', 'cpu', or 'cuda'.")
+            raise RuntimeError("CUDA device requested but CUDA is not available on this system.")
+        if device.index is not None and device.index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"CUDA device index {device.index} requested but only {torch.cuda.device_count()} device(s) detected."
+            )
+    if device.type == "mps":
+        if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
+            raise RuntimeError("MPS device requested but Metal Performance Shaders backend is not available.")
+
+    return device
 
 
 def parse_scenario_mix(argument: Optional[str]) -> Optional[Dict[ScenarioType, float]]:
@@ -3260,6 +3574,18 @@ def _log_configuration_summary(args: argparse.Namespace, *, log_file: Optional[P
     logger.info("  scenarios: %s | epochs: %s | batch: %s", args.num_scenarios, args.epochs, args.batch_size)
     logger.info("  learning_rate: %.4g | clip_norm: %.2f", args.learning_rate, args.clip_norm)
     logger.info("  validation_split: %.2f | workers: %d", args.validation_split, args.num_workers)
+    resolved_seed = args.seed if args.seed is not None else args.rng_seed
+    logger.info(
+        "  seed: %s | deterministic: %s | tf32: %s",
+        resolved_seed,
+        args.deterministic,
+        args.enable_tf32,
+    )
+    logger.info(
+        "  random_bot_fraction: %.3f | include_random_bot: %s",
+        args.random_bot_fraction,
+        args.include_random_bot,
+    )
     logger.info("  progress_bar: %s | log_batches: %s (interval=%d)", args.progress, args.log_batches, args.batch_log_interval)
     if csv_path:
         logger.info("  metrics_csv: %s", csv_path)
@@ -3315,13 +3641,38 @@ def run_cli() -> None:
     )
     parser.set_defaults(write_text_log=True)
     parser.add_argument("--log-level", type=str, default="INFO", help="Console log level (DEBUG, INFO, WARNING...).")
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Compute device.")
+    parser.add_argument("--device", type=str, default="auto", help="Compute device (auto, cpu, cuda, cuda:1, mps, etc.).")
     parser.add_argument("--num-workers", type=int, default=default_workers, help="DataLoader worker processes.")
     parser.add_argument("--run-name", type=str, default=None, help="Optional name for this training run.")
     parser.add_argument("--rng-seed", type=int, default=1024, help="Random seed for dataset generation.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Global seed applied to torch, numpy, pyro, and Python's random module (defaults to --rng-seed).",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Force deterministic torch/cuDNN behavior (disables autotune).",
+    )
+    parser.add_argument(
+        "--enable-tf32",
+        action="store_true",
+        help="Enable TF32 matrix math on supported hardware (ignored when --deterministic is set).",
+    )
     parser.add_argument("--scenario-mix", type=str, default=None, help="Custom scenario mix, e.g. FINISHER=0.4,DEFENDER=0.6.")
-    parser.add_argument("--no-random-bot", dest="include_random_bot", action="store_false", help="Exclude random bot persona.")
-    parser.set_defaults(include_random_bot=True)
+    parser.add_argument(
+        "--include-random-bot",
+        action="store_true",
+        help="Include the RandomBot persona during dataset generation (disabled by default).",
+    )
+    parser.add_argument(
+        "--random-bot-fraction",
+        type=float,
+        default=0.05,
+        help="Target fraction of RandomBot decisions to retain when included (0 <= f < 1).",
+    )
     parser.add_argument("--log-batches", action="store_true", help="Emit logs for individual batches.")
     parser.add_argument("--batch-log-interval", type=int, default=10, help="When logging batches, log every N batches.")
     parser.add_argument("--no-progress", dest="progress", action="store_false", help="Disable tqdm progress bar.")
@@ -3351,6 +3702,14 @@ def run_cli() -> None:
 
     _apply_preset(args, parser)
 
+    if not 0.0 <= args.random_bot_fraction < 1.0:
+        parser.error("--random-bot-fraction must be within [0.0, 1.0).")
+
+    resolved_seed = args.seed if args.seed is not None else args.rng_seed
+    tf32_requested = args.enable_tf32
+    tf32_enabled = tf32_requested and not args.deterministic
+    args.enable_tf32 = tf32_enabled
+
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_name = args.run_name or f"local_{args.mode}_{timestamp}"
     mode = GameMode(args.mode)
@@ -3365,6 +3724,12 @@ def run_cli() -> None:
         log_file_path = None
 
     configure_root_logger(args.log_level, log_file_path)
+
+    configure_seeds(resolved_seed, deterministic=args.deterministic, enable_tf32=tf32_enabled)
+
+    if args.deterministic and tf32_requested:
+        logger.info("Deterministic mode enabled; ignoring --enable-tf32 request.")
+    logger.info("Seed configuration | seed=%s | deterministic=%s | tf32=%s", resolved_seed, args.deterministic, tf32_enabled)
 
     if args.preset:
         logger.info(
@@ -3394,6 +3759,7 @@ def run_cli() -> None:
         scenario_mix=scenario_mix,
         rng_seed=args.rng_seed,
         include_random_bot=args.include_random_bot,
+        random_bot_fraction=max(0.0, min(args.random_bot_fraction, 0.99)),
     )
     dataset_seconds = time.perf_counter() - dataset_start
     logger.info(
@@ -3430,6 +3796,17 @@ def run_cli() -> None:
         state_encoder=state_encoder,
         config=training_config,
         device=device,
+    )
+
+    artifacts.metadata.update(
+        {
+            "seed": resolved_seed,
+            "rng_seed": args.rng_seed,
+            "deterministic": args.deterministic,
+            "tf32": tf32_enabled,
+            "include_random_bot": args.include_random_bot,
+            "random_bot_fraction": args.random_bot_fraction,
+        }
     )
 
     logger.info(

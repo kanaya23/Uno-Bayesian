@@ -1,0 +1,15 @@
+# Core dependencies for UNO BNN Training
+numpy>=1.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+pyro-ppl>=1.8.0
+
+# Web dashboard
+flask>=2.3.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Testing (development)
+pytest>=7.3.0

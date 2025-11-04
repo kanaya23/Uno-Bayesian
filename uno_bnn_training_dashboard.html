@@ -261,6 +261,24 @@
             color: var(--text-primary);
         }
 
+        .log-entry.log-level-debug {
+            color: var(--text-secondary);
+        }
+
+        .log-entry.log-level-info {
+            color: var(--text-secondary);
+        }
+
+        .log-entry.log-level-warning {
+            color: var(--danger);
+        }
+
+        .log-entry.log-level-error,
+        .log-entry.log-level-critical {
+            color: var(--danger);
+            font-weight: 600;
+        }
+
         .loading-visual {
             display: none;
             justify-content: center;
@@ -366,7 +384,7 @@
         <header>
             <div>
                 <h1>UNO BNN Training Console</h1>
-                <p class="tagline">Launch, observe, and iterate on your bot training runs without breaking stride.</p>
+                <p class="tagline">Launch, monitor, and manage your UNO bot training runs entirely on your machine.</p>
             </div>
             <div class="theme-toggle">
                 <span id="modeLabel">Dark mode</span>
@@ -417,8 +435,7 @@
                 <img src="https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExZ2wyNnozcnp2dms4ZHI5anRqYnRtd2EwODhvdWphMWw3cWUxOXdzNyZlcD12MV9naWZzX3NlYXJjaCZjdD1n/Y0bN1XMC7Jx5C/giphy.gif" alt="Training in progress" />
             </div>
         </section>
-
-        <section class="glass-card log-container">
+          <section class="glass-card log-container">
             <div class="section-head">
                 <h2 style="margin: 0; font-size: 1.2rem;">Training Log</h2>
                 <p style="margin: 8px 0 0; color: var(--text-secondary);">Live console stream from the training loop. Auto-scroll keeps the latest events in view.</p>
@@ -426,51 +443,50 @@
             <div class="log-stream" id="logStream" aria-live="polite"></div>
         </section>
 
-        <section class="glass-card">
-            <details>
-                <summary>Advanced Configuration</summary>
-                <div class="advanced-grid">
-                    <label>
-                        Training preset
-                        <select id="presetSelect">
-                            <option value="quick">Quick (15 epochs · 1.2k scenarios)</option>
-                            <option value="balanced" selected>Balanced (30 epochs · 4k scenarios)</option>
-                            <option value="max">Max (50 epochs · 6.4k scenarios)</option>
-                            <option value="stable">Stable (100 epochs · 32k scenarios)</option>
-                        </select>
-                    </label>
-                    <label>
-                        Learning rate
-                        <input id="lrInput" type="number" step="0.0001" min="0" value="0.001" />
-                    </label>
-                    <label>
-                        Batch size
-                        <input id="batchInput" type="number" min="1" value="128" />
-                    </label>
-                    <label>
-                        Scenarios
-                        <input id="scenarioInput" type="number" min="100" value="4000" />
-                    </label>
-                </div>
-            </details>
-        </section>
+          <section class="glass-card">
+              <details>
+                  <summary>Advanced Configuration</summary>
+                  <div class="advanced-grid">
+                      <label>
+                          Training preset
+                          <select id="presetSelect">
+                              <option value="quick">Quick (15 epochs · 1.2k scenarios)</option>
+                              <option value="balanced" selected>Balanced (30 epochs · 4k scenarios)</option>
+                              <option value="max">Max (50 epochs · 6.4k scenarios)</option>
+                              <option value="stable">Stable (100 epochs · 32k scenarios)</option>
+                          </select>
+                      </label>
+                      <label>
+                          Learning rate
+                          <input id="lrInput" type="number" step="0.0001" min="0" value="0.001" />
+                      </label>
+                      <label>
+                          Batch size
+                          <input id="batchInput" type="number" min="1" value="128" />
+                      </label>
+                      <label>
+                          Epochs
+                          <input id="epochInput" type="number" min="1" value="30" />
+                      </label>
+                      <label>
+                          Scenarios
+                          <input id="scenarioInput" type="number" min="100" value="4000" />
+                      </label>
+                  </div>
+              </details>
+          </section>
 
         <footer>
-            Hand-crafted for UNO BNN experimentation. Ready for future backend wiring.
+            Hand-crafted for UNO BNN experimentation. Powered by the local trainer backend.
         </footer>
     </div>
 
     <script>
+        const API_BASE = "";
+
         const themeToggle = document.getElementById("themeToggle");
         const modeLabel = document.getElementById("modeLabel");
         const root = document.documentElement;
-
-        const presets = {
-            quick: { epochs: 15, scenarios: 1200, batch: 96, lr: 0.002 },
-            balanced: { epochs: 30, scenarios: 4000, batch: 128, lr: 0.001 },
-            max: { epochs: 50, scenarios: 6400, batch: 192, lr: 0.0005 },
-            stable: { epochs: 100, scenarios: 32000, batch: 192, lr: 0.0001 }
-        };
 
         const statusText = document.getElementById("statusText");
         const presetLabel = document.getElementById("presetLabel");
@@ -486,201 +502,352 @@
         const presetSelect = document.getElementById("presetSelect");
         const lrInput = document.getElementById("lrInput");
         const batchInput = document.getElementById("batchInput");
+        const epochInput = document.getElementById("epochInput");
         const scenarioInput = document.getElementById("scenarioInput");
 
         const startBtn = document.getElementById("startBtn");
         const pauseBtn = document.getElementById("pauseBtn");
         const stopBtn = document.getElementById("stopBtn");
 
-        const formatTime = (seconds) => {
-            if (!Number.isFinite(seconds) || seconds < 0) return "—";
-            const m = Math.floor(seconds / 60);
-            const s = Math.max(0, Math.round(seconds % 60));
-            return m > 0 ? `${m}m ${s}s` : `${s}s`;
+        const presets = {
+            quick: { epochs: 15, scenarios: 1200, batch: 96, lr: 0.002 },
+            balanced: { epochs: 30, scenarios: 4000, batch: 128, lr: 0.001 },
+            max: { epochs: 50, scenarios: 6400, batch: 192, lr: 0.0005 },
+            stable: { epochs: 100, scenarios: 32000, batch: 192, lr: 0.0001 }
         };
 
-        class TrainingSimulator {
-            constructor() {
-                this.interval = null;
-                this.totalTicks = 0;
-                this.completedTicks = 0;
-                this.state = "idle";
-                this.epoch = 0;
-                this.lastLogTime = 0;
-                this.startedAt = null;
-                this.pausedAt = null;
-                this.elapsedBeforePause = 0;
+        const state = {
+            status: "idle",
+            eventSource: null,
+            reconnectTimer: null,
+            bootstrapMessageShown: false,
+            lastError: null,
+            statusErrorReported: false
+        };
+
+        const busyStatuses = new Set(["starting", "preparing", "running", "exporting", "stopping"]);
+        const logLimit = 500;
+
+        function formatTime(seconds) {
+            const value = Number(seconds);
+            if (!Number.isFinite(value) || value <= 0) {
+                return "—";
+            }
+            const hrs = Math.floor(value / 3600);
+            const mins = Math.floor((value % 3600) / 60);
+            const secs = Math.max(0, Math.round(value % 60));
+            if (hrs > 0) {
+                return `${hrs}h ${mins}m`;
+            }
+            if (mins > 0) {
+                return `${mins}m ${secs}s`;
+            }
+            return `${secs}s`;
+        }
+
+        function applyPresetSelection(key) {
+            const preset = presets[key] || presets.balanced;
+            lrInput.value = preset.lr;
+            batchInput.value = preset.batch;
+            epochInput.value = preset.epochs;
+            scenarioInput.value = preset.scenarios;
+        }
+
+        function gatherPayload() {
+            const presetKey = presetSelect.value || "balanced";
+            const learningRate = Number(lrInput.value);
+            const batchSize = Number.parseInt(batchInput.value, 10);
+            const epochs = Number.parseInt(epochInput.value, 10);
+            const numScenarios = Number.parseInt(scenarioInput.value, 10);
+
+            if (!Number.isFinite(learningRate) || learningRate <= 0) {
+                throw new Error("Learning rate must be a positive number.");
+            }
+            if (!Number.isInteger(batchSize) || batchSize <= 0) {
+                throw new Error("Batch size must be a positive integer.");
+            }
+            if (!Number.isInteger(epochs) || epochs <= 0) {
+                throw new Error("Epochs must be a positive integer.");
+            }
+            if (!Number.isInteger(numScenarios) || numScenarios <= 0) {
+                throw new Error("Scenarios must be a positive integer.");
             }
 
-            start() {
-                if (this.state === "running") return;
-                const preset = presets[presetSelect.value];
-                this.totalTicks = preset.epochs * 10;
-                this.completedTicks = 0;
-                this.state = "running";
-                this.epoch = 1;
-                this.startedAt = performance.now();
-                this.elapsedBeforePause = 0;
-                this.pausedAt = null;
-                this.scheduleInterval();
-                this.log("status", `Training started · ${presetSelect.options[presetSelect.selectedIndex].text}`);
-                this.render();
+            return {
+                preset: presetKey,
+                learning_rate: learningRate,
+                batch_size: batchSize,
+                epochs,
+                num_scenarios: numScenarios,
+                mode: "CLASSIC_2V2",
+                progress: true,
+                log_level: "INFO"
+            };
+        }
+
+        function appendLog(entry) {
+            if (!entry || !entry.message) {
+                return;
             }
-
-            resume() {
-                if (this.state !== "paused") return;
-                this.state = "running";
-                this.elapsedBeforePause += (this.pausedAt - this.startedAt);
-                this.startedAt = performance.now();
-                this.pausedAt = null;
-                this.scheduleInterval();
-                this.log("status", "Training resumed");
-                this.render();
+            const level = String(entry.level || "INFO").toLowerCase();
+            const timestamp = entry.timestamp ? new Date(entry.timestamp * 1000) : new Date();
+            const stampText = timestamp.toLocaleTimeString();
+            const element = document.createElement("div");
+            element.className = `log-entry log-level-${level}`;
+            element.textContent = `[${stampText}] ${entry.message}`;
+            const atBottom = Math.abs(logStream.scrollHeight - logStream.scrollTop - logStream.clientHeight) < 20;
+            logStream.appendChild(element);
+            while (logStream.children.length > logLimit) {
+                logStream.removeChild(logStream.firstChild);
             }
-
-            pause() {
-                if (this.state !== "running") return;
-                this.state = "paused";
-                this.clearInterval();
-                this.pausedAt = performance.now();
-                this.log("status", "Training paused");
-                this.render();
-            }
-
-            stop() {
-                if (this.state === "idle") return;
-                const wasRunning = this.state === "running";
-                this.state = "idle";
-                this.clearInterval();
-                this.log("status", wasRunning ? "Training stopped" : "Training reset");
-                this.render(true);
-            }
-
-            scheduleInterval() {
-                this.clearInterval();
-                this.interval = setInterval(() => this.tick(), 300);
-            }
-
-            clearInterval() {
-                if (this.interval) {
-                    clearInterval(this.interval);
-                    this.interval = null;
-                }
-            }
-
-            tick() {
-                if (this.state !== "running") return;
-                this.completedTicks = Math.min(this.completedTicks + 1, this.totalTicks);
-
-                const preset = presets[presetSelect.value];
-                const phaseProgress = this.completedTicks / this.totalTicks;
-                const epochFloat = phaseProgress * preset.epochs;
-                this.epoch = Math.min(preset.epochs, Math.max(1, Math.round(epochFloat)));
-
-                if (this.completedTicks >= this.totalTicks) {
-                    this.state = "completed";
-                    this.clearInterval();
-                    this.log("status", "Training finished successfully");
-                } else if (this.completedTicks % 10 === 0) {
-                    const accuracy = (0.78 + Math.random() * 0.18).toFixed(3);
-                    const loss = (0.8 - phaseProgress * 0.5 + Math.random() * 0.05).toFixed(3);
-                    this.log("metric", `Epoch ${this.epoch} | loss=${loss} | accuracy=${accuracy}`);
-                }
-
-                if (performance.now() - this.lastLogTime > 4000 && this.state === "running") {
-                    this.lastLogTime = performance.now();
-                    this.log("info", "Sampling stratified scenarios…");
-                }
-
-                this.render();
-            }
-
-            render(reset = false) {
-                const preset = presets[presetSelect.value];
-                let percent = reset ? 0 : Math.round((this.completedTicks / this.totalTicks) * 100) || 0;
-                if (this.state === "idle") {
-                    percent = 0;
-                }
-                progressFill.style.width = `${percent}%`;
-                progressTrack.setAttribute("aria-valuenow", String(percent));
-                percentLabel.textContent = `${percent}%`;
-
-                const elapsed = this.computeElapsedSeconds();
-                const remaining = this.state === "running" ? ((elapsed / Math.max(percent, 1)) * (100 - percent)) : NaN;
-                etaText.textContent = this.state === "running" ? formatTime(remaining) : (this.state === "completed" ? "Done" : "—");
-
-                if (reset || this.state === "idle") {
-                    progressDetail.textContent = "Awaiting run…";
-                    epochDetail.textContent = "Epoch 0 / 0";
-                } else if (this.state === "completed") {
-                    progressDetail.textContent = "Training complete";
-                    epochDetail.textContent = `Epoch ${preset.epochs} / ${preset.epochs}`;
-                } else {
-                    progressDetail.textContent = `Processing scenarios (${preset.scenarios.toLocaleString()} total)`;
-                    epochDetail.textContent = `Epoch ${this.epoch} / ${preset.epochs}`;
-                }
-
-                statusText.textContent = this.state === "running" ? "Training" : this.state.charAt(0).toUpperCase() + this.state.slice(1);
-                presetLabel.textContent = presetSelect.options[presetSelect.selectedIndex].text.split(" (")[0];
-
-                loadingVisual.style.display = this.state === "running" ? "flex" : "none";
-                loadingVisual.setAttribute("aria-hidden", this.state === "running" ? "false" : "true");
-
-                startBtn.textContent = this.state === "running" ? "▶ Running" : "▶ Start Training";
-                startBtn.disabled = this.state === "running";
-                pauseBtn.disabled = !["running", "paused"].includes(this.state);
-                pauseBtn.textContent = this.state === "paused" ? "▶ Resume" : "⏸ Pause";
-                stopBtn.disabled = this.state === "idle";
-            }
-
-            computeElapsedSeconds() {
-                if (!this.startedAt) return NaN;
-                if (this.state === "paused") {
-                    return (this.pausedAt - this.startedAt + this.elapsedBeforePause) / 1000;
-                }
-                return (performance.now() - this.startedAt + this.elapsedBeforePause) / 1000;
-            }
-
-            log(type, message) {
-                const stamp = new Date().toLocaleTimeString();
-                const entry = document.createElement("div");
-                entry.className = "log-entry";
-                entry.innerHTML = `<strong>[${stamp}]</strong> ${message}`;
-                logStream.appendChild(entry);
+            if (atBottom) {
                 logStream.scrollTop = logStream.scrollHeight;
             }
         }
 
-        const simulator = new TrainingSimulator();
-        simulator.render(true);
+        function emitLocalLog(level, message) {
+            appendLog({ timestamp: Date.now() / 1000, level, message });
+        }
 
-        themeToggle.addEventListener("change", () => {
-            const isLight = themeToggle.checked;
-            root.setAttribute("data-theme", isLight ? "light" : "dark");
-            modeLabel.textContent = isLight ? "Light mode" : "Dark mode";
-        });
-
-        presetSelect.addEventListener("change", () => {
-            const preset = presets[presetSelect.value];
-            lrInput.value = preset.lr;
-            batchInput.value = preset.batch;
-            scenarioInput.value = preset.scenarios;
-            simulator.render();
-        });
-
-        startBtn.addEventListener("click", () => simulator.start());
-        pauseBtn.addEventListener("click", () => {
-            if (simulator.state === "paused") {
-                simulator.resume();
-            } else {
-                simulator.pause();
+        function clearLogStream() {
+            while (logStream.firstChild) {
+                logStream.removeChild(logStream.firstChild);
             }
-        });
-        stopBtn.addEventListener("click", () => simulator.stop());
+        }
 
-        // Initialize advanced preset values
-        presetSelect.dispatchEvent(new Event("change"));
-        simulator.log("info", "Dashboard ready. Configure your run and hit start.");
+        function applyStatus(status) {
+            const normalized = status || {};
+            const statusCode = normalized.status || "idle";
+            const statusLabel = normalized.status_text || statusCode.charAt(0).toUpperCase() + statusCode.slice(1);
+            const percent = Number.isFinite(normalized.percent) ? Math.max(0, Math.min(100, Number(normalized.percent))) : 0;
+            const busy = busyStatuses.has(statusCode);
+
+            statusText.textContent = statusLabel;
+            percentLabel.textContent = `${Math.round(percent)}%`;
+            progressFill.style.width = `${percent}%`;
+            progressTrack.setAttribute("aria-valuenow", String(Math.round(percent)));
+
+            const detail = normalized.progress_detail || "Awaiting run...";
+            progressDetail.textContent = detail;
+
+            const epochCurrent = Number.isFinite(normalized.epoch_current) ? Number(normalized.epoch_current) : 0;
+            const epochTotal = Number.isFinite(normalized.epoch_total) ? Number(normalized.epoch_total) : 0;
+            epochDetail.textContent = `Epoch ${epochCurrent} / ${epochTotal}`;
+
+            if (statusCode === "running" && normalized.eta_seconds != null) {
+                etaText.textContent = formatTime(Number(normalized.eta_seconds));
+            } else if (statusCode === "completed") {
+                etaText.textContent = "Done";
+            } else if (statusCode === "exporting") {
+                etaText.textContent = "Finishing...";
+            } else if (busy) {
+                etaText.textContent = "Calculating...";
+            } else {
+                etaText.textContent = "—";
+            }
+
+            startBtn.disabled = busy;
+            startBtn.textContent = busy ? "▶ Running" : "▶ Start Training";
+            stopBtn.disabled = !busy;
+            pauseBtn.disabled = true;
+            pauseBtn.title = "Pause/resume control will be added in a future update.";
+            pauseBtn.textContent = "⏸ Pause (soon)";
+
+            const presetKey = normalized.preset || presetSelect.value || "balanced";
+            const presetName = normalized.preset_label || presetKey.charAt(0).toUpperCase() + presetKey.slice(1);
+            presetLabel.textContent = presetName;
+
+            if (busy) {
+                if (normalized.preset && presetSelect.value !== normalized.preset) {
+                    presetSelect.value = normalized.preset;
+                }
+                if (normalized.learning_rate !== undefined) {
+                    lrInput.value = String(normalized.learning_rate);
+                }
+                if (normalized.batch_size !== undefined) {
+                    batchInput.value = String(normalized.batch_size);
+                }
+                if (normalized.epoch_total !== undefined) {
+                    epochInput.value = String(normalized.epoch_total);
+                }
+                if (normalized.scenarios !== undefined) {
+                    scenarioInput.value = String(normalized.scenarios);
+                }
+            }
+
+            loadingVisual.style.display = busy ? "flex" : "none";
+            loadingVisual.setAttribute("aria-hidden", busy ? "false" : "true");
+
+            if (normalized.error && state.lastError !== normalized.error) {
+                emitLocalLog("ERROR", normalized.error);
+                state.lastError = normalized.error;
+            } else if (!normalized.error) {
+                state.lastError = null;
+            }
+
+            state.status = statusCode;
+        }
+
+        async function refreshStatus() {
+            try {
+                const response = await fetch(`${API_BASE}/api/status`);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const data = await response.json();
+                applyStatus(data);
+                state.statusErrorReported = false;
+            } catch (error) {
+                if (!state.statusErrorReported) {
+                    emitLocalLog("ERROR", `Unable to reach dashboard backend: ${error.message}`);
+                    state.statusErrorReported = true;
+                }
+            }
+        }
+
+        async function startTraining() {
+            if (busyStatuses.has(state.status)) {
+                return;
+            }
+            let payload;
+            try {
+                payload = gatherPayload();
+            } catch (error) {
+                emitLocalLog("ERROR", error.message);
+                return;
+            }
+
+            startBtn.disabled = true;
+            startBtn.textContent = "▶ Running";
+            clearLogStream();
+
+            try {
+                const response = await fetch(`${API_BASE}/api/train`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload)
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || "Failed to start training.");
+                }
+                if (data.state) {
+                    applyStatus(data.state);
+                }
+            } catch (error) {
+                emitLocalLog("ERROR", `Start failed: ${error.message}`);
+                await refreshStatus();
+            } finally {
+                if (!busyStatuses.has(state.status)) {
+                    startBtn.disabled = false;
+                    startBtn.textContent = "▶ Start Training";
+                }
+            }
+        }
+
+        async function stopTraining() {
+            if (!busyStatuses.has(state.status)) {
+                emitLocalLog("INFO", "No active training run to stop.");
+                return;
+            }
+            stopBtn.disabled = true;
+            try {
+                const response = await fetch(`${API_BASE}/api/stop`, { method: "POST" });
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    throw new Error(data.error || "Failed to stop training.");
+                }
+                if (data.state) {
+                    applyStatus(data.state);
+                }
+            } catch (error) {
+                emitLocalLog("ERROR", `Stop failed: ${error.message}`);
+            } finally {
+                if (busyStatuses.has(state.status)) {
+                    stopBtn.disabled = false;
+                }
+            }
+        }
+
+        function connectEventStream() {
+            if (state.eventSource) {
+                state.eventSource.close();
+                state.eventSource = null;
+            }
+            try {
+                const source = new EventSource(`${API_BASE}/api/events`);
+                source.addEventListener("status", (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        applyStatus(data);
+                    } catch (err) {
+                        emitLocalLog("ERROR", `Failed to parse status event: ${err.message}`);
+                    }
+                });
+                source.addEventListener("log", (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        appendLog(data);
+                    } catch (err) {
+                        emitLocalLog("ERROR", `Failed to parse log event: ${err.message}`);
+                    }
+                });
+                source.onopen = () => {
+                    if (state.reconnectTimer) {
+                        clearTimeout(state.reconnectTimer);
+                        state.reconnectTimer = null;
+                    }
+                };
+                source.onerror = () => {
+                    source.close();
+                    state.eventSource = null;
+                    if (!state.reconnectTimer) {
+                        state.reconnectTimer = setTimeout(() => {
+                            state.reconnectTimer = null;
+                            connectEventStream();
+                        }, 2500);
+                    }
+                };
+                state.eventSource = source;
+            } catch (error) {
+                emitLocalLog("ERROR", `Event stream error: ${error.message}`);
+            }
+        }
+
+        function setupEventHandlers() {
+            themeToggle.addEventListener("change", () => {
+                const isLight = themeToggle.checked;
+                root.setAttribute("data-theme", isLight ? "light" : "dark");
+                modeLabel.textContent = isLight ? "Light mode" : "Dark mode";
+            });
+
+            presetSelect.addEventListener("change", () => {
+                applyPresetSelection(presetSelect.value);
+            });
+
+            startBtn.addEventListener("click", startTraining);
+            pauseBtn.addEventListener("click", () => {
+                emitLocalLog("INFO", "Pause/resume controls are not yet available.");
+            });
+            pauseBtn.disabled = true;
+            pauseBtn.title = "Pause/resume control will be added in a future update.";
+            pauseBtn.textContent = "⏸ Pause (soon)";
+
+            stopBtn.addEventListener("click", stopTraining);
+        }
+
+        function initialize() {
+            setupEventHandlers();
+            applyPresetSelection(presetSelect.value || "balanced");
+            connectEventStream();
+            refreshStatus();
+            if (!state.bootstrapMessageShown) {
+                emitLocalLog("INFO", "Dashboard ready. Configure your run and hit start.");
+                state.bootstrapMessageShown = true;
+            }
+        }
+
+        initialize();
     </script>
 </body>
 </html>

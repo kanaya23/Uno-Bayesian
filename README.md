@@ -66,6 +66,23 @@ python train_local_bnn.py --preset quick
 tail -f training_logs/*.log
 ```
 
+### Dashboard Interface (optional)
+
+Prefer a point-and-click workflow? Launch the web dashboard backed by the same
+training pipeline:
+
+```bash
+python dashboard_server.py
+```
+
+This starts the Flask backend on <http://127.0.0.1:8000>. Open your browser to
+that address to configure runs, stream logs, and send stop requests without
+leaving the UI.
+
+On Windows, run `run_dashboard.bat` instead — it will create a `.venv`, install
+Flask plus the required PyTorch/Pyro packages, and then start the dashboard for
+you.
+
 Available presets:
 
 | Preset   | Scenarios | Epochs | Batch | Learning Rate | Progress Bar |

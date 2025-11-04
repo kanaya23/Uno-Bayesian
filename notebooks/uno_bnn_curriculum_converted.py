@@ -3515,23 +3515,30 @@ def _apply_preset(arg_namespace: argparse.Namespace, parser: argparse.ArgumentPa
     presets = {
         "quick": {
             "num_scenarios": 1200,
-            "epochs": 12,
+            "epochs": 15,
             "batch_size": 96,
-            "learning_rate": 4e-3,
+            "learning_rate": 2e-3,
             "progress": False,
         },
         "balanced": {
-            "num_scenarios": 2000,
-            "epochs": 20,
+            "num_scenarios": 4000,
+            "epochs": 30,
             "batch_size": 128,
-            "learning_rate": 3e-3,
+            "learning_rate": 1e-3,
             "progress": True,
         },
         "max": {
-            "num_scenarios": 3200,
-            "epochs": 30,
+            "num_scenarios": 6400,
+            "epochs": 50,
             "batch_size": 192,
-            "learning_rate": 2.5e-3,
+            "learning_rate": 5e-4,
+            "progress": True,
+        },
+        "stable": {
+            "num_scenarios": 32000,
+            "epochs": 100,
+            "batch_size": 192,
+            "learning_rate": 1e-4,
             "progress": True,
         },
     }

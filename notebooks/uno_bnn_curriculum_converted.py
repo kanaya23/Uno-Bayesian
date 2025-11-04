@@ -41,10 +41,12 @@ import itertools
 import json
 import logging
 import math
+import multiprocessing
 import os
 import random
 import statistics
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -98,8 +100,61 @@ except Exception:  # pragma: no cover - optional dependency
     tqdm = None
 
 DEFAULT_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DEFAULT_NUM_WORKERS = max(1, min(4, (os.cpu_count() or 1)))
+_CPU_COUNT = max(1, os.cpu_count() or 1)
+DEFAULT_NUM_WORKERS = max(1, min(_CPU_COUNT, math.ceil(_CPU_COUNT * 0.8)))
 ARTIFACT_SCHEMA_VERSION = "1.0.0"
+
+
+@dataclass(frozen=True)
+class SystemResourceProfile:
+    cpu_count: int
+    total_ram_gb: float
+    gpu_device_count: int
+    gpu_name: Optional[str]
+    total_gpu_memory_gb: Optional[float]
+    recommended_dataset_workers: int
+    recommended_dataloader_workers: int
+
+
+def detect_system_profile(target_cpu_fraction: float = 0.8) -> SystemResourceProfile:
+    cpu_count = max(1, os.cpu_count() or 1)
+
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        total_ram_bytes = page_size * phys_pages
+    except (AttributeError, ValueError, OSError):  # pragma: no cover - platform specific
+        total_ram_bytes = 0
+
+    total_ram_gb = total_ram_bytes / (1024 ** 3) if total_ram_bytes else 0.0
+
+    gpu_device_count = 0
+    gpu_name: Optional[str] = None
+    total_gpu_memory_gb: Optional[float] = None
+    if torch.cuda.is_available():  # pragma: no branch - runtime check
+        try:
+            gpu_device_count = torch.cuda.device_count()
+            if gpu_device_count > 0:
+                primary_index = torch.cuda.current_device()
+                gpu_name = torch.cuda.get_device_name(primary_index)
+                properties = torch.cuda.get_device_properties(primary_index)
+                total_gpu_memory_gb = properties.total_memory / (1024 ** 3)
+        except Exception:  # pragma: no cover - defensive fallback
+            gpu_device_count = max(gpu_device_count, 0)
+            gpu_name = gpu_name or None
+            total_gpu_memory_gb = total_gpu_memory_gb or None
+
+    recommended_workers = max(1, min(cpu_count, math.ceil(cpu_count * target_cpu_fraction)))
+
+    return SystemResourceProfile(
+        cpu_count=cpu_count,
+        total_ram_gb=total_ram_gb,
+        gpu_device_count=gpu_device_count,
+        gpu_name=gpu_name,
+        total_gpu_memory_gb=total_gpu_memory_gb,
+        recommended_dataset_workers=recommended_workers,
+        recommended_dataloader_workers=recommended_workers,
+    )
 
 # %% [code cell 2]
 class ScenarioType(enum.Enum):
@@ -2078,6 +2133,107 @@ def _downsample_random_bot_labels(
     return others + sampled_random
 
 
+@dataclass(frozen=True)
+class _BotSpec:
+    kind: str
+    base_seed: int
+    rollout_count: Optional[int] = None
+    rollout_depth: Optional[int] = None
+
+
+def _build_bot_specs(base_seed: int, include_random_bot: bool) -> List[_BotSpec]:
+    specs = [
+        _BotSpec("OracleBot", base_seed + 1, rollout_count=8, rollout_depth=4),
+        _BotSpec("AggressorBot", base_seed + 2),
+        _BotSpec("SupporterBot", base_seed + 3),
+        _BotSpec("ConservativeBot", base_seed + 4),
+    ]
+    if include_random_bot:
+        specs.append(_BotSpec("RandomBot", base_seed + 5))
+    return specs
+
+
+def _instantiate_bot(spec: _BotSpec) -> BotPolicy:
+    rng_obj = random.Random(spec.base_seed)
+    if spec.kind == "OracleBot":
+        rollout_count = spec.rollout_count if spec.rollout_count is not None else 8
+        rollout_depth = spec.rollout_depth if spec.rollout_depth is not None else 4
+        return OracleBot(rollout_count=rollout_count, rollout_depth=rollout_depth, rng=rng_obj)
+    if spec.kind == "AggressorBot":
+        return AggressorBot(rng=rng_obj)
+    if spec.kind == "SupporterBot":
+        return SupporterBot(rng=rng_obj)
+    if spec.kind == "ConservativeBot":
+        return ConservativeBot(rng=rng_obj)
+    if spec.kind == "RandomBot":
+        return RandomBot(rng=rng_obj)
+    raise ValueError(f"Unknown bot kind '{spec.kind}'")
+
+
+def _label_scenario_chunk(
+    payload: Tuple[Sequence[Tuple[int, ScenarioExample]], Sequence[_BotSpec], int]
+) -> List[LabeledScenario]:
+    entries, bot_specs, labeler_seed = payload
+    labeler = ScenarioLabeler(rng=random.Random(labeler_seed))
+    bot_pairs = [(_instantiate_bot(spec), spec) for spec in bot_specs]
+    bots = [bot for bot, _ in bot_pairs]
+    labeled: List[LabeledScenario] = []
+    for global_index, scenario in entries:
+        for bot, spec in bot_pairs:
+            bot.rng.seed(spec.base_seed + global_index)
+        labeled.extend(labeler.label([scenario], bots))
+    return labeled
+
+
+def _label_scenarios_parallel(
+    scenarios: Sequence[ScenarioExample],
+    *,
+    bot_specs: Sequence[_BotSpec],
+    labeler_seed: int,
+    workers: Optional[int],
+) -> Tuple[List[LabeledScenario], int]:
+    indexed_scenarios: List[Tuple[int, ScenarioExample]] = list(enumerate(scenarios))
+    if not indexed_scenarios:
+        return [], 0
+
+    target_workers = workers if workers is not None else max(1, min(_CPU_COUNT, math.ceil(_CPU_COUNT * 0.8)))
+    if target_workers <= 1 or len(indexed_scenarios) < 2:
+        logger.debug(
+            "Scenario labeling executing sequentially | scenarios=%d",
+            len(indexed_scenarios),
+        )
+        labeled = _label_scenario_chunk((indexed_scenarios, bot_specs, labeler_seed))
+        return labeled, 1
+
+    max_workers = max(1, min(target_workers, len(indexed_scenarios)))
+    chunk_size = max(1, math.ceil(len(indexed_scenarios) / max_workers))
+    payloads: List[Tuple[Sequence[Tuple[int, ScenarioExample]], Sequence[_BotSpec], int]] = []
+    for chunk_idx, start in enumerate(range(0, len(indexed_scenarios), chunk_size)):
+        chunk = indexed_scenarios[start : start + chunk_size]
+        payloads.append((chunk, bot_specs, labeler_seed + chunk_idx))
+
+    executor_kwargs = {"max_workers": max_workers}
+    try:
+        mp_ctx = multiprocessing.get_context("spawn")
+        executor_kwargs["mp_context"] = mp_ctx
+    except ValueError:  # pragma: no cover - platform fallback
+        pass
+
+    logger.debug(
+        "Scenario labeling executing in parallel | scenarios=%d | workers=%d | chunk_size=%d",
+        len(indexed_scenarios),
+        max_workers,
+        chunk_size,
+    )
+
+    labeled_results: List[LabeledScenario] = []
+    with ProcessPoolExecutor(**executor_kwargs) as executor:
+        for chunk_result in executor.map(_label_scenario_chunk, payloads):
+            labeled_results.extend(chunk_result)
+
+    return labeled_results, max_workers
+
+
 def build_synthetic_dataset(
     *,
     mode: GameMode,
@@ -2086,6 +2242,7 @@ def build_synthetic_dataset(
     rng_seed: int = 1024,
     include_random_bot: bool = False,
     random_bot_fraction: float = 0.05,
+    dataset_workers: Optional[int] = None,
 ) -> Tuple[ScenarioDataset, List[LabeledScenario], StateEncoder, ActionEncoder]:
     rng = random.Random(rng_seed)
     forge = ScenarioForge(rng=rng)
@@ -2107,26 +2264,33 @@ def build_synthetic_dataset(
             )
 
     rng_seed += 1
-    bots: List[BotPolicy] = [
-        OracleBot(rollout_count=8, rollout_depth=4, rng=random.Random(rng_seed + 1)),
-        AggressorBot(rng=random.Random(rng_seed + 2)),
-        SupporterBot(rng=random.Random(rng_seed + 3)),
-        ConservativeBot(rng=random.Random(rng_seed + 4)),
-    ]
-    random_bot: Optional[RandomBot] = None
-    if include_random_bot:
-        random_bot = RandomBot(rng=random.Random(rng_seed + 5))
-        bots.append(random_bot)
+    bot_specs = _build_bot_specs(rng_seed, include_random_bot)
+    labeler_seed_base = rng_seed + 6
+    base_labeled, worker_count = _label_scenarios_parallel(
+        scenarios,
+        bot_specs=bot_specs,
+        labeler_seed=labeler_seed_base,
+        workers=dataset_workers,
+    )
+    logger.info(
+        "Scenario labeling complete | scenarios=%d | personas=%d | workers=%d",
+        len(scenarios),
+        len(bot_specs),
+        max(1, worker_count),
+    )
 
-    labeler = ScenarioLabeler(rng=random.Random(rng_seed + 6))
-    base_labeled = labeler.label(scenarios, bots)
-    if random_bot is not None and 0.0 <= random_bot_fraction < 1.0:
+    random_bot_name = "RandomBot" if any(spec.kind == "RandomBot" for spec in bot_specs) else None
+    if random_bot_name and 0.0 <= random_bot_fraction < 1.0:
         base_labeled = _downsample_random_bot_labels(
             base_labeled,
             target_fraction=random_bot_fraction,
             rng=rng,
-            persona_name=random_bot.name,
+            persona_name=random_bot_name,
         )
+
+    labeler = ScenarioLabeler(rng=random.Random(labeler_seed_base + max(1, worker_count)))
+    bots = [_instantiate_bot(spec) for spec in bot_specs]
+
     augmented: List[LabeledScenario] = list(base_labeled)
     color_augmented = _augment_labeled_by_color_symmetry(base_labeled, _cyclic_color_mappings())
     augmented.extend(color_augmented)
@@ -3554,7 +3718,12 @@ def _log_configuration_summary(args: argparse.Namespace, *, log_file: Optional[P
     logger.info("  device: %s", args.device)
     logger.info("  scenarios: %s | epochs: %s | batch: %s", args.num_scenarios, args.epochs, args.batch_size)
     logger.info("  learning_rate: %.4g | clip_norm: %.2f", args.learning_rate, args.clip_norm)
-    logger.info("  validation_split: %.2f | workers: %d", args.validation_split, args.num_workers)
+    logger.info(
+        "  validation_split: %.2f | dataloader_workers: %d | dataset_workers: %d",
+        args.validation_split,
+        args.num_workers,
+        args.dataset_workers,
+    )
     resolved_seed = args.seed if args.seed is not None else args.rng_seed
     logger.info(
         "  seed: %s | deterministic: %s | tf32: %s",
@@ -3585,8 +3754,9 @@ def run_cli() -> None:
         description="Train the UNO Bayesian neural network locally with configurable logging.",
     )
 
-    local_cpu_count = max(1, os.cpu_count() or 1)
-    default_workers = min(2, local_cpu_count)
+    system_profile = detect_system_profile()
+    default_workers = system_profile.recommended_dataloader_workers
+    default_dataset_workers = system_profile.recommended_dataset_workers
 
     parser.add_argument("--num-scenarios", type=int, default=2000, help="Number of synthetic scenarios to generate.")
     parser.add_argument(
@@ -3624,6 +3794,12 @@ def run_cli() -> None:
     parser.add_argument("--log-level", type=str, default="INFO", help="Console log level (DEBUG, INFO, WARNING...).")
     parser.add_argument("--device", type=str, default="auto", help="Compute device (auto, cpu, cuda, cuda:1, mps, etc.).")
     parser.add_argument("--num-workers", type=int, default=default_workers, help="DataLoader worker processes.")
+    parser.add_argument(
+        "--dataset-workers",
+        type=int,
+        default=default_dataset_workers,
+        help="Worker processes for scenario labeling (0 to disable parallelism).",
+    )
     parser.add_argument("--run-name", type=str, default=None, help="Optional name for this training run.")
     parser.add_argument("--rng-seed", type=int, default=1024, help="Random seed for dataset generation.")
     parser.add_argument(
@@ -3685,6 +3861,8 @@ def run_cli() -> None:
 
     if not 0.0 <= args.random_bot_fraction < 1.0:
         parser.error("--random-bot-fraction must be within [0.0, 1.0).")
+    if args.dataset_workers < 0:
+        parser.error("--dataset-workers must be >= 0.")
 
     resolved_seed = args.seed if args.seed is not None else args.rng_seed
     tf32_requested = args.enable_tf32
@@ -3705,6 +3883,30 @@ def run_cli() -> None:
         log_file_path = None
 
     configure_root_logger(args.log_level, log_file_path)
+
+    if system_profile.total_ram_gb:
+        ram_display = f"{system_profile.total_ram_gb:.1f} GB"
+    else:  # pragma: no cover - fallback for unknown RAM
+        ram_display = "unknown"
+
+    if system_profile.gpu_device_count > 0:
+        gpu_memory = (
+            f"{system_profile.total_gpu_memory_gb:.1f} GB"
+            if system_profile.total_gpu_memory_gb is not None
+            else "unknown memory"
+        )
+        gpu_name = system_profile.gpu_name or "CUDA device"
+        gpu_summary = f"{gpu_name} ({gpu_memory}, {system_profile.gpu_device_count} device(s))"
+    else:
+        gpu_summary = "none"
+
+    logger.info(
+        "System profile | cpu=%d | ram=%s | gpu=%s | recommended_workers=%d",
+        system_profile.cpu_count,
+        ram_display,
+        gpu_summary,
+        system_profile.recommended_dataset_workers,
+    )
 
     configure_seeds(resolved_seed, deterministic=args.deterministic, enable_tf32=tf32_enabled)
 
@@ -3741,6 +3943,7 @@ def run_cli() -> None:
         rng_seed=args.rng_seed,
         include_random_bot=args.include_random_bot,
         random_bot_fraction=max(0.0, min(args.random_bot_fraction, 0.99)),
+        dataset_workers=args.dataset_workers,
     )
     dataset_seconds = time.perf_counter() - dataset_start
     logger.info(

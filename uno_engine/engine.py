@@ -271,40 +271,16 @@ class UnoEngine:
         had_valid_moves = bool(self.get_valid_moves(state, player_id))
 
         cloned_state = self._clone_state(state)
-        drawn_card = self._draw_single(cloned_state, player_index)
+        self._draw_single(cloned_state, player_index)
 
         if had_valid_moves:
             self._advance_turn(cloned_state, 1)
             return cloned_state
 
-        current_color = self._current_color(cloned_state)
-        top_card = cloned_state.discard_pile[-1]
-        if self._is_card_playable(drawn_card, cloned_state.players[player_index].hand, top_card, current_color):
-            cloned_state.pending_action = PendingAction(
-                player_id=player_id,
-                type=PendingActionType.DRAWN_CARD_PLAY_WINDOW,
-                allowed_cards=(drawn_card,),
-            )
-        else:
-            self._advance_turn(cloned_state, 1)
-
-        return cloned_state
-
-    def pass_turn(self, state: GameState, player_id: str) -> GameState:
-        """Explicitly pass after drawing when no play is made."""
-
-        self._ensure_round_active(state)
-
-        if not state.pending_action or state.pending_action.type != PendingActionType.DRAWN_CARD_PLAY_WINDOW:
-            raise InvalidMoveError("No drawn-card window is active.")
-
-        if state.pending_action.player_id != player_id:
-            raise InvalidMoveError("Only the drawing player may pass.")
-
-        cloned_state = self._clone_state(state)
-        cloned_state.pending_action = None
+        # Turn ends after drawing (no pass action allowed)
         self._advance_turn(cloned_state, 1)
         return cloned_state
+
 
     def choose_color(self, state: GameState, player_id: str, color: Color) -> GameState:
         """Resolve an outstanding color declaration (e.g., initial wild)."""
@@ -555,7 +531,6 @@ class UnoEngine:
     GetValidMoves = get_valid_moves
     PlayCard = play_card
     DrawCard = draw_card
-    PassTurn = pass_turn
     ChooseColor = choose_color
 
 

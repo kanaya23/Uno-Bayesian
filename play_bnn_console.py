@@ -231,8 +231,6 @@ def describe_token(token: str) -> str:
     token = token.upper()
     if token == "DRAW":
         return "Draw a card"
-    if token == "PASS":
-        return "Pass"
     parts = token.split("_")
     if len(parts) < 2:
         return token
@@ -402,7 +400,7 @@ class ConsoleUnoBNNInterface:
         self._display_bnn_analysis(state, analysis)
 
         while True:
-            command = input("Action ([p]lay #, [d]raw, [pa]ss, [q]uit): ").strip().lower()
+            command = input("Action ([p]lay #, [d]raw, [q]uit): ").strip().lower()
             if command in {"q", "quit"}:
                 raise SystemExit("Session terminated by user.")
 
@@ -435,15 +433,6 @@ class ConsoleUnoBNNInterface:
                     return state
                 except InvalidMoveError as exc:
                     print(f"Draw not allowed: {exc}")
-                    continue
-
-            if command in {"pa", "pass"}:
-                try:
-                    state = self.engine.pass_turn(state, self.user_id)
-                    print("You pass the turn.")
-                    return state
-                except InvalidMoveError as exc:
-                    print(f"Pass not allowed: {exc}")
                     continue
 
             print("Unrecognized command. Try again.")
@@ -485,9 +474,6 @@ class ConsoleUnoBNNInterface:
             elif action.action_type == ActionType.DRAW:
                 state = self.engine.draw_card(state, player_id)
                 print(f"{display_name} draws a card.")
-            elif action.action_type == ActionType.PASS:
-                state = self.engine.pass_turn(state, player_id)
-                print(f"{display_name} passes.")
         except InvalidMoveError as exc:
             print(f"Bot action invalid ({exc}); forcing draw.")
             try:
@@ -554,7 +540,7 @@ class ConsoleUnoBNNInterface:
                     f"Draw stack active: {pending.draw_penalty} cards owed by {pending.player_id}."
                 )
             elif pending.type == PendingActionType.DRAWN_CARD_PLAY_WINDOW:
-                print("Drawn card window: you may play the drawn card or pass.")
+                print("Drawn card window: you may play the drawn card.")
 
         print("Hand:")
         hand = state.current_player().hand

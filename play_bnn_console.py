@@ -273,7 +273,7 @@ class ConsoleUnoBNNInterface:
         teammate_name: str = "AllyBot",
         opponent_names: Sequence[str] = ("NorthBot", "EastBot"),
         use_guided: bool = False,
-        ismcts_simulations: int = 256,
+        ismcts_simulations: int = 64,
         ismcts_topn: int = 3,
         ismcts_top_p: float = 0.6,
         ismcts_alpha: float = 0.75,
@@ -816,7 +816,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--ismcts-simulations",
         type=int,
-        default=256,
+        default=64,
         help="Number of guided ISMCTS simulations to run per decision when enabled.",
     )
     parser.add_argument(

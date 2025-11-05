@@ -30,12 +30,12 @@ from notebooks.uno_bnn_curriculum_converted import (
 
 def clone_bot_action(action: BotAction) -> BotAction:
     """Return a shallow clone of *action* preserving metadata."""
-
+    # Optimized: card and chosen_color are immutable, info dict is copied only when needed
     return BotAction(
         action_type=action.action_type,
         card=action.card,
         chosen_color=action.chosen_color,
-        info=dict(action.info),
+        info=action.info.copy() if action.info else {},
     )
 
 
@@ -52,8 +52,8 @@ class BNNActionPrior:
     pruned: bool = False
 
     def replicate(self) -> "BNNActionPrior":
-        """Return a deep-copy style clone safe for tree reuse."""
-
+        """Return a lightweight clone safe for tree reuse."""
+        # Optimized: most fields are immutable, only clone the action
         return BNNActionPrior(
             token=self.token,
             action=clone_bot_action(self.action),
@@ -359,7 +359,33 @@ class ISMCTSBase:
         self.rollout_depth = rollout_depth
 
     def _clone_state(self, state: GameState) -> GameState:
-        return copy.deepcopy(state)
+        # Fast shallow clone - most game state objects are immutable or won't be modified
+        # Only deeply clone mutable collections that will be modified
+        return GameState(
+            players=[
+                Player(
+                    player_id=p.player_id,
+                    hand=list(p.hand),  # Clone hand list but cards are immutable
+                    score=p.score,
+                )
+                for p in state.players
+            ],
+            draw_pile=list(state.draw_pile),
+            discard_pile=list(state.discard_pile),
+            current_player_index=state.current_player_index,
+            play_direction=state.play_direction,
+            current_color=state.current_color,
+            pending_action=state.pending_action,  # Shallow copy - typically not modified in simulations
+            round_over=state.round_over,
+            round_winner_id=state.round_winner_id,
+            game_over=state.game_over,
+            game_winner_ids=state.game_winner_ids,
+            mode=state.mode,
+            team_map=state.team_map,  # Shallow copy - immutable
+            team_scores=dict(state.team_scores),  # Clone dict
+            round_winning_team_ids=state.round_winning_team_ids,
+            draw_stack_total=state.draw_stack_total,
+        )
 
     def _apply_action(self, state: GameState, player_id: str, action: BotAction) -> GameState:
         if action.action_type == ActionType.PLAY and action.card is not None:
@@ -454,6 +480,7 @@ class GuidedISMCTS(BNNMixin, ISMCTSBase):
         self.max_branching = max(1, int(max_branching))
         self.probability_mass_limit = float(max(probability_mass_limit, 0.0))
         self.rollout_alpha = float(min(max(rollout_alpha, 0.0), 1.0))
+        self._eval_cache: Dict[int, BNNContext] = {}  # Cache for BNN evaluations
         super().__init__(
             artifacts,
             persona_hint=persona_hint,
@@ -490,6 +517,7 @@ class GuidedISMCTS(BNNMixin, ISMCTSBase):
         return selected
 
     def _rollout(self, state: GameState, current_player: Optional[str], root_player: str) -> float:
+        """Fast heuristic rollout without expensive BNN evaluations."""
         if current_player is None:
             return self._evaluate_reward(state, root_player)
 
@@ -497,8 +525,8 @@ class GuidedISMCTS(BNNMixin, ISMCTSBase):
         working_state = state
         player = current_player
         while depth > 0 and not working_state.round_over and player is not None:
-            context = self.build_context_from_state(self.engine, working_state, player)
-            action = self._select_rollout_action(context)
+            # Use fast heuristic rollout instead of expensive BNN evaluation
+            action = self._fast_heuristic_action(working_state, player)
             working_state = self._apply_action(working_state, player, action)
             if working_state.round_over:
                 break
@@ -506,20 +534,67 @@ class GuidedISMCTS(BNNMixin, ISMCTSBase):
             depth -= 1
         return self._evaluate_reward(working_state, root_player)
 
-    def _select_rollout_action(self, context: BNNContext) -> BotAction:
-        if not context.priors:
-            if context.valid_actions:
-                return clone_bot_action(self.rng.choice(context.valid_actions))
+    def _state_hash(self, state: GameState, player_id: str) -> int:
+        """Fast hash for state caching (not cryptographic, just for lookup)."""
+        # Hash based on key state features
+        h = hash((
+            player_id,
+            state.current_player_index,
+            len(state.draw_pile),
+            len(state.discard_pile),
+            state.discard_pile[-1] if state.discard_pile else None,
+            state.current_color,
+            tuple(len(p.hand) for p in state.players),
+        ))
+        return h
+    
+    def _get_cached_or_evaluate(self, state: GameState, player_id: str) -> BNNContext:
+        """Get cached evaluation or compute new one."""
+        state_hash = self._state_hash(state, player_id)
+        if state_hash in self._eval_cache:
+            return self._eval_cache[state_hash]
+        
+        evaluation = self.evaluate_state(self.engine, state, player_id)
+        context = self.context_from_evaluation(evaluation, player_id)
+        self._eval_cache[state_hash] = context
+        return context
+    
+    def _fast_heuristic_action(self, state: GameState, player_id: str) -> BotAction:
+        """Fast heuristic action selection without BNN evaluation.
+        
+        Strategy:
+        1. If we have a playable card, play it (prefer high-value action cards)
+        2. Otherwise draw
+        """
+        valid_moves = self.engine.get_valid_moves(state, player_id)
+        
+        if not valid_moves:
             return BotAction(ActionType.DRAW)
-
-        if self.rng.random() < self.rollout_alpha:
-            weights = [max(prior.probability, 0.0) for prior in context.priors]
-            if sum(weights) <= 0:
-                weights = [1.0 for _ in context.priors]
-            choice = self.rng.choices(context.priors, weights=weights, k=1)[0]
-        else:
-            choice = self.rng.choice(context.priors)
-        return clone_bot_action(choice.action)
+        
+        # Simple heuristic: prefer action cards and high-value cards
+        best_card = valid_moves[0]
+        best_score = -1
+        
+        for card in valid_moves:
+            score = 0
+            # Prefer action cards
+            if card.type in {CardType.SKIP, CardType.REVERSE, CardType.DRAW_TWO}:
+                score += 20
+            elif card.type in {CardType.WILD, CardType.WILD_DRAW_FOUR}:
+                score += 30
+            # Add card value
+            score += card.value
+            
+            if score > best_score:
+                best_score = score
+                best_card = card
+        
+        # For wild cards, pick a random color
+        chosen_color = None
+        if best_card.type in {CardType.WILD, CardType.WILD_DRAW_FOUR}:
+            chosen_color = self.rng.choice([Color.RED, Color.YELLOW, Color.GREEN, Color.BLUE])
+        
+        return BotAction(ActionType.PLAY, card=best_card, chosen_color=chosen_color)
 
     def search(
         self,
@@ -533,6 +608,9 @@ class GuidedISMCTS(BNNMixin, ISMCTSBase):
         player_id = bnn_context.player_id
         root_team = game_state.team_index_for(player_id)
         root_state = self._determinize_state(game_state, player_id)
+        
+        # Clear cache for each new search to avoid stale data
+        self._eval_cache.clear()
 
         priors = self._filtered_priors(bnn_context.priors)
         if not priors:
@@ -585,8 +663,7 @@ class GuidedISMCTS(BNNMixin, ISMCTSBase):
                 child_context: Optional[BNNContext] = None
                 child_priors: List[BNNActionPrior] = []
                 if not state.round_over and next_player is not None:
-                    evaluation = self.evaluate_state(self.engine, state, next_player)
-                    child_context = self.context_from_evaluation(evaluation, next_player)
+                    child_context = self._get_cached_or_evaluate(state, next_player)
                     child_priors = self._filtered_priors(child_context.priors)
 
                 child_team = state.team_index_for(next_player) if next_player is not None else node.team_index

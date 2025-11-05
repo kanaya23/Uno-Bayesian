@@ -78,8 +78,8 @@ class UnoEngine:
         shuffle_in_place(deck, self._rng)
 
         # Deal 7 cards to each player in sequence.
-        for _ in range(7):
-            for player in ordered_players:
+        for player in ordered_players:
+            for _ in range(7):
                 player.hand.append(deck.pop())
 
         discard_pile: List[Card] = []

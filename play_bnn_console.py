@@ -279,6 +279,10 @@ class ConsoleUnoBNNInterface:
         ismcts_alpha: float = 0.75,
         ismcts_exploration: float = 1.5,
         ismcts_rollout_depth: int = 10,
+        ismcts_time_limit: Optional[float] = None,
+        ismcts_max_depth: int = 6,
+        enable_cache: bool = True,
+        parallel_workers: int = 1,
     ) -> None:
         if persona not in BOT_ORDER:
             raise ValueError(
@@ -308,6 +312,10 @@ class ConsoleUnoBNNInterface:
                 rollout_alpha=ismcts_alpha,
                 exploration_constant=ismcts_exploration,
                 rollout_depth=ismcts_rollout_depth,
+                enable_state_cache=enable_cache,
+                time_limit=ismcts_time_limit,
+                max_simulation_depth=ismcts_max_depth,
+                parallel_workers=parallel_workers,
             )
         else:
             self._guided_helper = None
@@ -850,6 +858,29 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Maximum depth for guided ISMCTS rollouts.",
     )
     parser.add_argument(
+        "--ismcts-time-limit",
+        type=float,
+        default=None,
+        help="Time budget in seconds for ISMCTS search (adaptive simulation control).",
+    )
+    parser.add_argument(
+        "--ismcts-max-depth",
+        type=int,
+        default=6,
+        help="Maximum simulation tree depth (prevents overly deep explorations).",
+    )
+    parser.add_argument(
+        "--disable-cache",
+        action="store_true",
+        help="Disable BNN state evaluation caching.",
+    )
+    parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for ISMCTS (experimental, requires careful setup).",
+    )
+    parser.add_argument(
         "--mode",
         choices=["classic", "wild"],
         help="Start directly in the specified mode (otherwise prompt).",
@@ -905,6 +936,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         ismcts_alpha=args.ismcts_alpha,
         ismcts_exploration=args.ismcts_exploration,
         ismcts_rollout_depth=args.ismcts_rollout_depth,
+        ismcts_time_limit=args.ismcts_time_limit,
+        ismcts_max_depth=args.ismcts_max_depth,
+        enable_cache=not args.disable_cache,
+        parallel_workers=args.parallel_workers,
     )
 
     initial_mode: Optional[GameMode] = None

@@ -28,6 +28,13 @@ import torch
 from uno_engine import UnoEngine, GameMode, InvalidMoveError
 from uno_engine.models import Card, CardType, Color, GameState, PendingActionType, Player
 
+from ismcts_guided import (
+    BNNContext,
+    GuidedISMCTS,
+    build_bnn_context,
+    select_action_from_evaluation,
+)
+
 try:
     from notebooks.uno_bnn_curriculum_converted import (
         ActionEncoder,
@@ -47,7 +54,6 @@ try:
         SupporterBot,
         TrainingArtifacts,
         state_encoder_signature,
-        evaluate_state_with_bnn,
     )
 except ModuleNotFoundError as exc:  # pragma: no cover - runtime guard
     missing = exc.name or "required dependency"
@@ -87,6 +93,7 @@ class BNNAnalysis:
     mean_probability: float
     probability_std: float
     selection_reason: str
+    ismcts_simulations: Optional[int] = None
 
 
 def discover_latest_model(models_dir: Path) -> Optional[Tuple[Path, Path]]:
@@ -265,6 +272,13 @@ class ConsoleUnoBNNInterface:
         user_name: str = "You",
         teammate_name: str = "AllyBot",
         opponent_names: Sequence[str] = ("NorthBot", "EastBot"),
+        use_guided: bool = False,
+        ismcts_simulations: int = 256,
+        ismcts_topn: int = 3,
+        ismcts_top_p: float = 0.6,
+        ismcts_alpha: float = 0.75,
+        ismcts_exploration: float = 1.5,
+        ismcts_rollout_depth: int = 10,
     ) -> None:
         if persona not in BOT_ORDER:
             raise ValueError(
@@ -278,6 +292,25 @@ class ConsoleUnoBNNInterface:
         self.persona = persona
         self.mc_samples = mc_samples
         self.engine = UnoEngine()
+        self.use_guided = use_guided
+        self.ismcts_simulations = max(1, int(ismcts_simulations))
+        self._guided_helper: Optional[GuidedISMCTS] = None
+        if self.use_guided:
+            guided_rng = random.Random(313)
+            self._guided_helper = GuidedISMCTS(
+                artifacts,
+                persona_hint=persona,
+                mc_samples=mc_samples,
+                engine=UnoEngine(),
+                rng=guided_rng,
+                max_branching=ismcts_topn,
+                probability_mass_limit=ismcts_top_p,
+                rollout_alpha=ismcts_alpha,
+                exploration_constant=ismcts_exploration,
+                rollout_depth=ismcts_rollout_depth,
+            )
+        else:
+            self._guided_helper = None
 
         # Canonical identifiers expected by the BNN stack (P0..P3)
         self.user_id = "P0"
@@ -564,8 +597,61 @@ class ConsoleUnoBNNInterface:
             name = self.display_names.get(player.player_id, player.player_id)
             print(f"  {name:>10} ({role}) - {len(player.hand)} cards")
 
+    def _build_prediction_entries(self, context: BNNContext) -> List[PredictionEntry]:
+        evaluation = context.evaluation
+        entries: List[PredictionEntry] = []
+        candidates = evaluation.get("candidates", [])
+        for candidate in candidates:
+            if len(entries) >= 5:
+                break
+            probability = float(candidate.get("prob", candidate.get("raw_prob", 0.0)))
+            std_val = candidate.get("std")
+            entries.append(
+                PredictionEntry(
+                    token=candidate.get("token", ""),
+                    probability=probability,
+                    std_dev=float(std_val) if std_val is not None else 0.0,
+                    is_valid=not candidate.get("pruned", False),
+                    action=candidate.get("action"),
+                )
+            )
+
+        if entries:
+            return entries
+
+        valid_token_map = {
+            self.artifacts.action_encoder._to_token(action): action
+            for action in context.valid_actions
+        }
+        mean_probs = context.mean_probs_masked
+        if mean_probs is None or mean_probs.numel() == 0:
+            mean_probs = context.mean_probs
+
+        count = min(5, int(mean_probs.numel()))
+        if count > 0:
+            values, indices = torch.topk(mean_probs, k=count)
+            for value, index in zip(values, indices):
+                idx = int(index.item())
+                token = self.artifacts.action_encoder.decode(idx)
+                action = valid_token_map.get(token)
+                std_val = 0.0
+                if context.std_probs_masked is not None and 0 <= idx < context.std_probs_masked.shape[0]:
+                    std_val = float(context.std_probs_masked[idx].item())
+                entries.append(
+                    PredictionEntry(
+                        token=token,
+                        probability=float(value.item()),
+                        std_dev=std_val,
+                        is_valid=action is not None,
+                        action=action,
+                    )
+                )
+
+        return entries
+
     def _display_bnn_analysis(self, state: GameState, analysis: BNNAnalysis) -> None:
-        print("\nBNN perspective:")
+        label = "BNN+ISMCTS perspective" if self.use_guided else "BNN perspective"
+        print(f"\n{label}:")
         print(
             f"  Scenario: {analysis.scenario_type.value} | "
             f"Entropy: {analysis.entropy:.3f} | MI: {analysis.mutual_information:.3f}"
@@ -593,161 +679,49 @@ class ConsoleUnoBNNInterface:
             )
 
     def _analyze_state_with_bnn(self, state: GameState) -> BNNAnalysis:
-        scenario_type = self._bnn_helper._infer_scenario_type(state, self.user_id)
-        metadata = self._bnn_helper._infer_metadata(state, self.user_id)
+        evaluation = self._bnn_helper.evaluate_candidates(self.engine, state, self.user_id)
+        context = build_bnn_context(self.artifacts, evaluation, self.user_id)
+        entries = self._build_prediction_entries(context)
 
-        evaluation = evaluate_state_with_bnn(
-            self.artifacts,
-            state=state,
-            target_player=self.user_id,
-            persona_name=self.persona,
-            scenario_type=scenario_type,
-            metadata=metadata,
-            num_samples=self.mc_samples,
-        )
+        suggestion: BotAction
+        ismcts_runs: Optional[int] = None
 
-        mc = evaluation["mc"]
-        mean_probs = mc["mean_probs"].reshape(-1).clone()
-
-        std_probs = mc.get("std_probs")
-        if std_probs is not None:
-            std_probs = std_probs.reshape(-1).clone()
-
-        entropy_tensor = mc["predictive_entropy"].reshape(-1)
-        entropy = float(entropy_tensor[0].item())
-
-        mi_tensor = mc["mutual_information"].reshape(-1)
-        mutual_information = float(mi_tensor[0].item())
-
-        valid_actions = self._bnn_helper.enumerate_actions(self.engine, state, self.user_id)
-        valid_token_map = {
-            self.artifacts.action_encoder._to_token(action): action for action in valid_actions
-        }
-
-        # Ensure mean_probs has the expected size for action encoder
-        expected_size = len(self.artifacts.action_encoder.lookup)
-        if mean_probs.numel() != expected_size:
-            # Model output size mismatch - create properly sized tensor
-            print(
-                f"Warning: Model output size ({mean_probs.numel()}) doesn't match action encoder size ({expected_size})"
-            )
-            device = mean_probs.device
-            dtype = mean_probs.dtype
-            corrected_probs = torch.full((expected_size,), 1.0 / expected_size, dtype=dtype, device=device)
-            copy_size = min(mean_probs.numel(), expected_size)
-            if copy_size > 0:
-                corrected_probs[:copy_size].copy_(mean_probs[:copy_size])
-
-            total = corrected_probs.sum()
-            if total.item() > 0:
-                corrected_probs = corrected_probs / total
-            mean_probs = corrected_probs
-
-            if std_probs is not None:
-                corrected_std = torch.zeros(expected_size, dtype=std_probs.dtype, device=std_probs.device)
-                if copy_size > 0:
-                    corrected_std[:copy_size].copy_(std_probs[:copy_size])
-                std_probs = corrected_std
-
-        mask = torch.zeros_like(mean_probs)
-        valid_indices: List[int] = []
-        for token in valid_token_map:
-            idx = self.artifacts.action_encoder.lookup.get(token)
-            if idx is None:
-                continue
-            # Ensure index is within bounds
-            if int(idx) < mean_probs.size(0):
-                valid_indices.append(int(idx))
-        if valid_indices:
-            mask[valid_indices] = 1.0
-        mean_probs_masked = mean_probs * mask if valid_indices else mean_probs
-        if valid_indices:
-            total = mean_probs_masked.sum()
-            if total.item() > 0:
-                mean_probs_masked = mean_probs_masked / total
-        std_probs_masked = None
-        if std_probs is not None:
-            std_probs_masked = std_probs.clone()
-            if valid_indices:
-                std_probs_masked = std_probs_masked * mask
-        else:
-            std_probs_masked = torch.zeros_like(mean_probs_masked)
-
-        if valid_indices:
-            prob_slice = mean_probs_masked[valid_indices]
-            prob_mean = float(prob_slice.mean().item())
-            prob_std = float(prob_slice.std(unbiased=False).item())
-        else:
-            prob_mean = float(mean_probs.mean().item())
-            prob_std = float(mean_probs.std(unbiased=False).item())
-
-        top_candidates = torch.argsort(mean_probs_masked, descending=True)
-        entries: List[PredictionEntry] = []
-        for index in top_candidates:
-            if len(entries) >= 5:
-                break
-            idx = int(index.item())
-            token = self.artifacts.action_encoder.decode(idx)
-            action = valid_token_map.get(token)
-            if action is None:
-                continue
-            probability = float(mean_probs_masked[idx].item())
-            if valid_indices and probability <= 0:
-                continue
-            std_val = 0.0
-            if std_probs_masked is not None:
-                std_val = float(std_probs_masked[idx].item())
-            entries.append(
-                PredictionEntry(
-                    token=token,
-                    probability=probability,
-                    std_dev=std_val,
-                    is_valid=True,
-                    action=action,
+        if self.use_guided and self._guided_helper is not None:
+            try:
+                suggestion = self._guided_helper.search(state, context, self.ismcts_simulations)
+                ismcts_runs_raw = suggestion.info.get("ismcts_simulations")
+                if isinstance(ismcts_runs_raw, int):
+                    ismcts_runs = ismcts_runs_raw
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                logger.error("Guided ISMCTS search failed: %s", exc, exc_info=logger.isEnabledFor(logging.DEBUG))
+                suggestion = select_action_from_evaluation(
+                    evaluation,
+                    self._bnn_helper,
+                    self.artifacts,
+                    state,
+                    self.user_id,
                 )
+        else:
+            suggestion = select_action_from_evaluation(
+                evaluation,
+                self._bnn_helper,
+                self.artifacts,
+                state,
+                self.user_id,
             )
 
-        if not entries:
-            top_k = min(5, mean_probs.shape[0])
-            top_values, top_indices = torch.topk(mean_probs, k=top_k)
-            for value, index in zip(top_values, top_indices):
-                idx = int(index.item())
-                token = self.artifacts.action_encoder.decode(idx)
-                action = valid_token_map.get(token)
-                std_val = 0.0
-                if std_probs is not None and 0 <= idx < std_probs.shape[0]:
-                    std_val = float(std_probs[idx].item())
-                entries.append(
-                    PredictionEntry(
-                        token=token,
-                        probability=float(value.item()),
-                        std_dev=std_val,
-                        is_valid=action is not None,
-                        action=action,
-                    )
-                )
-                if len(entries) >= 5:
-                    break
-
-        suggestion = self._bnn_helper.decide(self.engine, state, self.user_id)
         suggested_token = self.artifacts.action_encoder._to_token(suggestion)
-        suggested_index = self.artifacts.action_encoder.lookup.get(suggested_token)
-        suggested_probability = 0.0
-        suggested_std = 0.0
-        if suggested_index is not None:
-            idx = int(suggested_index)
-            target_probs = mean_probs_masked if valid_indices else mean_probs
-            if 0 <= idx < target_probs.shape[0]:
-                suggested_probability = float(target_probs[idx].item())
-            if std_probs_masked is not None and 0 <= idx < std_probs_masked.shape[0]:
-                suggested_std = float(std_probs_masked[idx].item())
+        prior = context.token_to_prior.get(suggested_token)
 
-        suggested_probability = float(
-            suggestion.info.get("bnn_probability", suggested_probability)
-        )
-        info_std = suggestion.info.get("bnn_probability_std")
-        if info_std is not None:
-            suggested_std = float(info_std)
+        suggested_probability = float(suggestion.info.get("bnn_probability", 0.0))
+        suggested_std = float(suggestion.info.get("bnn_probability_std") or 0.0)
+
+        if prior is not None:
+            if not suggestion.info.get("bnn_probability"):
+                suggested_probability = prior.probability
+            if prior.std_dev is not None and not suggestion.info.get("bnn_probability_std"):
+                suggested_std = float(prior.std_dev)
+
         selection_reason = suggestion.info.get("selection_reason", "probability")
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -757,25 +731,26 @@ class ConsoleUnoBNNInterface:
             )
             logger.debug(
                 "BNN analysis | entropy=%.3f | MI=%.3f | reason=%s | top=%s",
-                entropy,
-                mutual_information,
+                context.entropy,
+                context.mutual_information,
                 selection_reason,
                 top_debug,
             )
 
         return BNNAnalysis(
-            scenario_type=scenario_type,
-            entropy=entropy,
-            mutual_information=mutual_information,
+            scenario_type=context.scenario_type,
+            entropy=context.entropy,
+            mutual_information=context.mutual_information,
             entries=entries,
             suggested_action=suggestion,
             suggested_token=suggested_token,
             suggested_probability=suggested_probability,
             suggested_std=suggested_std,
-            mc_samples=self.mc_samples,
-            mean_probability=prob_mean,
-            probability_std=prob_std,
+            mc_samples=context.mc_samples,
+            mean_probability=context.mean_probability,
+            probability_std=context.probability_std,
             selection_reason=selection_reason,
+            ismcts_simulations=ismcts_runs,
         )
 
     def _display_round_results(self, state: GameState) -> None:
@@ -834,6 +809,47 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Number of Monte Carlo samples for BNN predictive inference.",
     )
     parser.add_argument(
+        "--use-ismcts",
+        action="store_true",
+        help="Enable guided ISMCTS for action recommendations.",
+    )
+    parser.add_argument(
+        "--ismcts-simulations",
+        type=int,
+        default=256,
+        help="Number of guided ISMCTS simulations to run per decision when enabled.",
+    )
+    parser.add_argument(
+        "--ismcts-alpha",
+        type=float,
+        default=0.75,
+        help="Rollout policy mixing factor (alpha) for guided ISMCTS rollouts.",
+    )
+    parser.add_argument(
+        "--ismcts-topn",
+        type=int,
+        default=3,
+        help="Maximum number of actions expanded per node in guided ISMCTS.",
+    )
+    parser.add_argument(
+        "--ismcts-top-p",
+        type=float,
+        default=0.6,
+        help="Cumulative probability mass threshold for guided ISMCTS expansion.",
+    )
+    parser.add_argument(
+        "--ismcts-exploration",
+        type=float,
+        default=1.5,
+        help="Exploration constant used in guided ISMCTS (PUCT scaling).",
+    )
+    parser.add_argument(
+        "--ismcts-rollout-depth",
+        type=int,
+        default=10,
+        help="Maximum depth for guided ISMCTS rollouts.",
+    )
+    parser.add_argument(
         "--mode",
         choices=["classic", "wild"],
         help="Start directly in the specified mode (otherwise prompt).",
@@ -878,7 +894,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     except FileNotFoundError as exc:
         raise SystemExit(str(exc)) from exc
 
-    interface = ConsoleUnoBNNInterface(artifacts, persona=args.persona)
+    interface = ConsoleUnoBNNInterface(
+        artifacts,
+        persona=args.persona,
+        mc_samples=args.mc_samples,
+        use_guided=args.use_ismcts,
+        ismcts_simulations=args.ismcts_simulations,
+        ismcts_topn=args.ismcts_topn,
+        ismcts_top_p=args.ismcts_top_p,
+        ismcts_alpha=args.ismcts_alpha,
+        ismcts_exploration=args.ismcts_exploration,
+        ismcts_rollout_depth=args.ismcts_rollout_depth,
+    )
 
     initial_mode: Optional[GameMode] = None
     if args.mode == "classic":
